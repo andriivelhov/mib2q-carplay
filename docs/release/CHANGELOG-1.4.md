@@ -13,15 +13,23 @@ Changes since [1.3.1](CHANGELOG-1.3.1.md).
   - turn card ON: `maps:/car/instrumentcluster?showETA=…&showSpeedLimit=…&showCompass=…`
   - turn card OFF: `maps:/car/instrumentcluster/map?showETA=…&maneuverLayout=no&showSpeedLimit=…&showCompass=…`
 
-## Not changed
+- **HW301 image v1167: ETA, speed limit and compass on the wide cockpit layout only.** The
+  dongle now picks the cluster URL by cockpit layout:
+  - wide: `maps:/car/instrumentcluster?showETA=yes&showSpeedLimit=yes&showCompass=yes`
+  - classic and Sport small maps: `maps:/car/instrumentcluster?showETA=no&showSpeedLimit=no&showCompass=no`
+    (turn card only, as in v1166)
 
-- **HW301:** the dongle sets its own cluster URL in its image (v1166: no `showCompass`). The
-  compass switch does not reach it.
+  When the cockpit switches between wide and a small map, the dongle sends the phone `showUI`
+  with the new URL before `updateViewArea`. The URLs are built into the image; the head unit's
+  GEM switches still do not reach the dongle. Image `dongle/hw301/fw/hw301_v1167.tar`
+  (marker `v1167-20261025192423`). *Car test pending.*
 
 ## Documentation
 
 - [altscreen-mhi2q](../deploy/altscreen-mhi2q.md): the compass switch is added to the cluster
   URL switch table.
+- [hw301-dongle](../deploy/hw301-dongle.md), dongle README and FINDINGS: v1167 and its
+  per-layout URLs.
 
 ## Updating from 1.3.1
 

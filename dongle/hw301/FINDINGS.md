@@ -18,6 +18,7 @@ Built on top of that: the phone drawing maneuver and ETA
 (v1160 back-channel). The release image v1164 includes all of these, plus the Sport-skin
 ViewArea, 300 px small-map SafeAreas and the initial URL without `maneuverLayout` (issue #20).
 v1166 adds key frame requests from the head unit (cold-start fix, see *Cluster content and layout*).
+v1167 gives the wide layout ETA, speed limit and compass, and keeps the small maps bare.
 
 ```
 iPhone ==Wi-Fi AirPlay==> HW301 (receiver: libAirPlay) ==USB CarPlay==> MHI2Q
@@ -169,10 +170,16 @@ of frames, `nal_ok=1 bad=0`):
 
 ## Cluster content and layout
 
-- `initialURL` = `maps:/car/instrumentcluster?showETA=no&showSpeedLimit=no`.
-  With it the phone draws the turn card but no ETA (v1166; v1156-v1164 had `showETA=yes`). No `maneuverLayout`: `rightAligned` pushed the puck left
+- URL per cockpit layout (v1167):
+  - wide (ViewArea 0, also `initialURL`): `maps:/car/instrumentcluster?showETA=yes&showSpeedLimit=yes&showCompass=yes`
+  - classic and Sport (ViewArea 1, 2): `maps:/car/instrumentcluster?showETA=no&showSpeedLimit=no&showCompass=no`
+
+  On a `VIEW` back-channel change whose URL differs from the last one sent, the dongle sends
+  `showUI {uuid, url}` and then `updateViewArea`. The last URL is global (reset by every `/info`),
+  so a new stream-111 thread does not re-send it. v1166 had the small URL for every layout
+  (v1156-v1164 had `showETA=yes`). No `maneuverLayout`: `rightAligned` pushed the puck left
   of the card (issue #20), same as the head-unit hook's RGI-off URL. The bare `/map` URL is the "head unit draws RGI" variant.
-  Change it with `-DCLUSTER_URL_INITIAL=...`.
+  Change them with `-DCLUSTER_URL_WIDE=...` / `-DCLUSTER_URL_SMALL=...`.
 - On the dongle path the **dongle** advertises the URL; the head unit serves stock `/info`. The
   MIB-menu maneuver toggle therefore has no effect on the dongle path.
 - SafeArea for this A5 cockpit: height **270** (297 was wrong). Wide = 360,87,720,270,
@@ -218,6 +225,7 @@ of frames, `nal_ok=1 bad=0`):
 | 1162 | previous release = same source as 1160 with diagnostics off (`v1162-20261020152434`) | archived `fw/hw301_v1162.tar` |
 | 1164 | release: third ViewArea (Sport skin small map 566,64,360,300), classic 520,64,400,300, `initialURL` without `maneuverLayout=rightAligned` (`build_dual.sh release`, `v1164-20261021080230`). Sport ViewArea *car test pending* | archived `fw/hw301_v1164.tar` |
 | **1166** | release: v1164 + no ETA (`showETA=no`) + `KEYF` back-channel key frame requests and a late key frame 3 s after the relay attaches; fixes the blank cockpit map after a cold start (`build_dual.sh release`, `v1166-20261021090922`). *Car test pending* | archived `fw/hw301_v1166.tar` |
+| **1167** | release: v1166 + per-layout URL: wide = ETA, speed limit and compass; classic / Sport = turn card only; `showUI` on a layout change (`build_dual.sh release`, `v1167-20261025192423`). *Car test pending* | archived `fw/hw301_v1167.tar` |
 
 ## Open items
 

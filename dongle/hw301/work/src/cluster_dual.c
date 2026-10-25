@@ -159,12 +159,26 @@
  * without maneuverLayout: rightAligned pinned the card to the SafeArea's right
  * edge and the app moved the puck left of it (issue #20; on the Sport skin the
  * card also went behind the rev counter). No ETA on the cockpit (v1166): the
- * root URL still keeps the turn card with showETA=no. Override with
- * -DCLUSTER_URL_INITIAL=... (e.g. the RGI-on bare /map when the head unit draws
- * its own maneuver). */
-#ifndef CLUSTER_URL_INITIAL
-#define CLUSTER_URL_INITIAL "maps:/car/instrumentcluster?showETA=no&showSpeedLimit=no"
+ * root URL still keeps the turn card with showETA=no.
+ * Per cockpit layout (v1167): the wide view gets ETA, speed limit and compass;
+ * the classic and Sport small maps keep the bare turn card (no room, and on the
+ * Sport skin they sat behind the rev counter). The initial URL is the wide one
+ * (initialViewArea 0); a VIEW change re-sends showUI when the URL differs.
+ * Override with -DCLUSTER_URL_WIDE=... / -DCLUSTER_URL_SMALL=... (e.g. the
+ * RGI-on bare /map when the head unit draws its own maneuver). */
+#ifndef CLUSTER_URL_WIDE
+#define CLUSTER_URL_WIDE "maps:/car/instrumentcluster?showETA=yes&showSpeedLimit=yes&showCompass=yes"
 #endif
+#ifndef CLUSTER_URL_SMALL
+#define CLUSTER_URL_SMALL "maps:/car/instrumentcluster?showETA=no&showSpeedLimit=no&showCompass=no"
+#endif
+#ifndef CLUSTER_URL_INITIAL
+#define CLUSTER_URL_INITIAL CLUSTER_URL_WIDE
+#endif
+/* URL the phone was last given for the cluster: initialURL on every /info,
+ * then each showUI. Global, so a new stream-111 thread after a showUI does not
+ * re-send it again. */
+static const char *volatile g_cur_url = CLUSTER_URL_INITIAL;
 #define URL_CLUSTER "maps:/car/instrumentcluster"
 #define URL_MAP "maps:/car/instrumentcluster/map"
 #define URL_CARD "maps:/car/instrumentcluster/instructioncard"
@@ -745,6 +759,7 @@ static CFRef augment_info(CFRef base) {
     set_str(alt, "uuid", CLUSTER_UUID);
     /* no "displayUUID": the stock display and the head-unit hook's both use only "uuid" */
     set_str(alt, "initialURL", CLUSTER_URL_INITIAL);
+    g_cur_url = CLUSTER_URL_INITIAL;
     add_urls(alt);
     add_views(alt);
     cf_array_append(displays, alt);
@@ -1019,6 +1034,33 @@ __attribute__((unused)) static void send_view(void *session, int view) {
         dlog("updateViewArea -> phone index=%d rc=%d", view, e);
     }
     if (adj) cf_release(adj);
+    if (params) cf_release(params);
+    if (req) cf_release(req);
+}
+
+/* Cluster content for a cockpit layout: index 0 = wide, 1 = classic, 2 = Sport. */
+static const char *view_url(int view) {
+    return view == 0 ? CLUSTER_URL_WIDE : CLUSTER_URL_SMALL;
+}
+
+/* Ask the phone for new cluster content: showUI{uuid, url}, the command the
+ * head-unit hook sends for a GEM switch press. Same send path as ask_keyframe.
+ * Sent before updateViewArea so the layout is applied last. */
+__attribute__((unused)) static void send_showui(void *session, const char *url) {
+    CFRef req, params;
+    if (!session || !r_send_cmd || !url) return;
+    req = cf_dict_new(0, 0, dict_key_cb, dict_val_cb);
+    params = cf_dict_new(0, 0, dict_key_cb, dict_val_cb);
+    if (req && params) {
+        OSStatus e;
+        set_str(req, "type", "showUI");
+        set_str(params, "uuid", CLUSTER_UUID);
+        set_str(params, "url", url);
+        set_value(req, "params", params);
+        e = r_send_cmd(session, req, (void *)kf_done, 0);
+        g_cur_url = url;
+        dlog("showUI -> phone url=%s rc=%d", url, e);
+    }
     if (params) cf_release(params);
     if (req) cf_release(req);
 }
@@ -1461,7 +1503,11 @@ static void *rx_thread(void *varg) {
         if (STEP_RELAY && !disabled() && !flag(NORELAY_FILE)) {
             int kf = 0, vw = relay_poll_bc(&kf);
             long now = time_plain(0);
-            if (vw >= 0 && vw != last_view) { last_view = vw; send_view(a.session, vw); }
+            if (vw >= 0 && vw < VIEW_COUNT && vw != last_view) {
+                last_view = vw;
+                if (strcmp(view_url(vw), g_cur_url) != 0) send_showui(a.session, view_url(vw));
+                send_view(a.session, vw);
+            }
             if (kf && now - kf_last >= KF_MIN_S) {
                 kf_last = now;
                 dlog("head-unit asked for a key frame");

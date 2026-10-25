@@ -90,14 +90,14 @@ without any of these.
 | --- | --- | --- | --- |
 | Baseus Safe Journey Series Wireless CarPlay Adapter | build `26031311.2705.1` | fast | yes, no custom firmware, [report](https://github.com/kamgurgul/mib2q-carplay/issues/5) |
 | Carlinkit 5.0 / 2Air | software `2025.12.29.1746`, hardware `U2AC822C0` | slow, then stable | yes, no custom firmware, [report](https://github.com/kamgurgul/mib2q-carplay/issues/5) |
-| HW301 (Allwinner, setup Wi-Fi `smartBox`, web UI `192.168.5.1`) | custom app image **v1166** (`v1166-20261021090922`) | same as stock HW301 | yes, **from release 1.3**, only with that image plus the 1.3 head-unit install. Stock v1.26 / v1.29 stay on the main screen. [How to flash](docs/deploy/hw301-dongle.md) |
+| HW301 (Allwinner, setup Wi-Fi `smartBox`, web UI `192.168.5.1`) | custom app image **v1167** (`v1167-20261025192423`) | same as stock HW301 | yes, **from release 1.3**, only with that image plus the 1.3 head-unit install. Stock v1.26 / v1.29 stay on the main screen. [How to flash](docs/deploy/hw301-dongle.md) |
 | AAWireless TWO+ | manufacturer custom test build; public firmware pending | fast | yes, CarPlay AltScreen and Android Auto, tested on P5092 / MU1329; current public firmware has no cluster map until the fix ships, [report](https://github.com/kamgurgul/mib2q-carplay/issues/26) |
 
 An HW301 on stock firmware tells the head unit it is an iPhone 7 (`iPhone9,1` / `18D70`)
-and never opens the cluster stream, so the cockpit keeps the Audi map. The v1166 image
+and never opens the cluster stream, so the cockpit keeps the Audi map. The v1167 image
 keeps that main screen and adds the cluster stream; it needs mib2q-carplay **1.3** or newer
 on the head unit. Other `smartBox-xxxx` boards are not this image; do not flash
-`hw301_v1166.tar` onto them.
+`hw301_v1167.tar` onto them.
 
 ## Requirements
 

@@ -18,12 +18,12 @@ shows CarPlay on the MMI only, and the Virtual Cockpit keeps the Audi map. This 
 because the dongle presents itself to the car as an iPhone 7 (`iPhone9,1` / `18D70`) and
 never opens the cluster stream.
 
-The custom app image **v1166** keeps the stock main-screen behaviour and adds the phone's
+The custom app image **v1167** keeps the stock main-screen behaviour and adds the phone's
 cluster map on the Virtual Cockpit:
 
 - the iPhone draws a dedicated cluster view, not a copy of the MMI screen;
 - the steering-wheel roller zooms the map;
-- the phone draws the turn card on the cluster (no ETA from v1166);
+- the phone draws the turn card on the cluster; the wide layout also shows ETA, speed limit and compass, the classic and Sport small maps only the turn card (from v1167);
 - switching between the wide, classic and Sport-skin cockpit layouts resizes the map.
   The previous image v1162 knows only wide and classic; on the Sport skin it keeps the previous layout.
 
@@ -38,7 +38,7 @@ It is CarPlay only. It does not add Android Auto on the cluster.
 
 | File | What it is |
 | --- | --- |
-| `dongle/hw301/fw/hw301_v1166.tar` | the custom image you flash (marker `v1166-20261021090922`) |
+| `dongle/hw301/fw/hw301_v1167.tar` | the custom image you flash (marker `v1167-20261025192423`) |
 | `dongle/hw301/fw/hw301_v1162.tar` | the previous custom image (marker `v1162-20261020152434`), no Sport-skin layout |
 | `dongle/hw301/fw/hw301_v1160.tar` | the same version as v1162, but it also contains enabled logging. Flash it only to collect logs for a bug report (`--version 1160`, marker `v1160-20261021065350`) |
 | `dongle/hw301/fw/hw301_v129.tar` | official stock v1.29, the rollback image |
@@ -52,7 +52,7 @@ It is CarPlay only. It does not add Android Auto on the cluster.
 > unplug the dongle while the flash percent is moving. Other `smartBox-xxxx` boards are not
 > HW301; do not flash this image onto them.
 
-## Flash v1166
+## Flash v1167
 
 1. Install or update the head unit to 1.3 first ([install](install.md)). Leave **Cluster video ON**.
 2. Power the HW301 from a USB charger. Do not connect it to the car.
@@ -61,18 +61,18 @@ It is CarPlay only. It does not add Android Auto on the cluster.
 4. Check the image without writing anything:
 
    ```bash
-   python3 dongle/hw301/work/tools/flash_local.py dongle/hw301/fw/hw301_v1166.tar --version 1166 --dry-run
+   python3 dongle/hw301/work/tools/flash_local.py dongle/hw301/fw/hw301_v1167.tar --version 1167 --dry-run
    ```
 
    The dry run prints the tar size and `127` chunks, and says it is not sending.
 5. Flash it:
 
    ```bash
-   python3 dongle/hw301/work/tools/flash_local.py dongle/hw301/fw/hw301_v1166.tar --version 1166
+   python3 dongle/hw301/work/tools/flash_local.py dongle/hw301/fw/hw301_v1167.tar --version 1167
    ```
 
    Wait until both the upload bar and the flash percent finish.
-6. Optional check: `curl http://192.168.5.1/clbuild.txt` prints `v1166-20261021090922`.
+6. Optional check: `curl http://192.168.5.1/clbuild.txt` prints `v1167-20261025192423`.
 7. Unplug the dongle and plug it back into the charger once. Then install it in the car.
 8. Connect the phone through the dongle. The Virtual Cockpit shows the phone's map. A long
    press of the left steering-wheel roller switches between that map and the Audi map. A short
@@ -102,7 +102,7 @@ The full procedure covers entering FEL, backing up the flash first, writing
 
 | Symptom | Try |
 | --- | --- |
-| No map on the cockpit, CarPlay on the MMI works | Head unit on 1.3 with **Cluster video ON**? `clbuild.txt` shows v1166? Reconnect the phone. |
+| No map on the cockpit, CarPlay on the MMI works | Head unit on 1.3 with **Cluster video ON**? `clbuild.txt` shows v1167? Reconnect the phone. |
 | CarPlay does not start at all after the flash | Flash stock v1.29 (above) and report it with the dongle logs. |
 | Dongle dead after a flash (no LED, no Wi-Fi) | [FEL recovery](#recovery-when-the-dongle-no-longer-starts). |
 

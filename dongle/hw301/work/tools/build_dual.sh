@@ -4,7 +4,7 @@
 #
 #   build_dual.sh [target]      target = release | release-input | optA | optA-input
 #
-#   release        -> hw301_v1166.tar  shipped image: HU_DIRECT, diagnostics off
+#   release        -> hw301_v1167.tar  shipped image: HU_DIRECT, diagnostics off
 #   release-input  -> hw301_v1163.tar  same, Input ChaCha key (fallback only)
 #   optA           -> hw301_v1160.tar  release + enabled logging (archived fw/ copy is v1162 source)
 #   optA-input     -> hw301_v1155.tar  optA with the Input key (fallback only)
@@ -29,7 +29,7 @@ build_step() {
 }
 
 case "${1:-release}" in
-  release)       build_step 1166 "-DCLUSTER_DIAG=0" ;;
+  release)       build_step 1167 "-DCLUSTER_DIAG=0" ;;
   release-input) build_step 1163 "-DCLUSTER_DIAG=0 -DCLUSTER_KEY_INPUT=1" ;;
   optA)          build_step 1160 ;;
   optA-input)    build_step 1155 "-DCLUSTER_KEY_INPUT=1" ;;
