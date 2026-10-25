@@ -237,6 +237,9 @@ case $ACT in
     cluster_speed)
         cluster_switch showSpeedLimit no "Speed limit"
         ;;
+    cluster_compass)
+        cluster_switch showCompass no "Compass"
+        ;;
     reacquire)
         # Test: re-send the cluster showUI in the running session, so iOS picks
         # which navigation app draws the VC map again (/tmp, consumed by the hook).
@@ -267,7 +270,7 @@ case $ACT in
         echo "DONE. CarPlay-RGI menu removed; it disappears after the next reboot."
         ;;
     *)
-        echo "usage: run.sh install|uninstall|logs|lsd|verbose|altscreen_on|altscreen_off|rgd_enable|rgd_disable|aa_cluster_on|aa_cluster_off|aa_daynight|touchpad_dpad_on|touchpad_dpad_off|grid|safearea|safearea_reset|singleview|cluster_maneuver|cluster_eta|cluster_speed|reacquire|hwdec|hwdelay|siri_short|omxprobe|remove_menu"
+        echo "usage: run.sh install|uninstall|logs|lsd|verbose|altscreen_on|altscreen_off|rgd_enable|rgd_disable|aa_cluster_on|aa_cluster_off|aa_daynight|touchpad_dpad_on|touchpad_dpad_off|grid|safearea|safearea_reset|singleview|cluster_maneuver|cluster_eta|cluster_speed|cluster_compass|reacquire|hwdec|hwdelay|siri_short|omxprobe|remove_menu"
         exit 2
         ;;
 esac

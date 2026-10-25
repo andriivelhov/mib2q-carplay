@@ -1,7 +1,6 @@
 # mib2q-carplay 1.3.1 - changelog
 
-Changes since [1.3](CHANGELOG-1.3.md). Entries marked *car test pending* passed the bench
-tests but have not been driven yet.
+Changes since [1.3](CHANGELOG-1.3.md).
 
 ## New
 
@@ -18,9 +17,6 @@ tests but have not been driven yet.
   the file is written by hand. URLs:
   - turn card ON: `maps:/car/instrumentcluster?showETA=…&showSpeedLimit=…`
   - turn card OFF: `maps:/car/instrumentcluster/map?showETA=…&maneuverLayout=no&showSpeedLimit=…`
-
-  *Car test pending:* whether iOS draws the ETA and the speed limit on the bare `/map` surface,
-  and whether it takes the new request without a reconnect.
 
 ## Changed
 

@@ -169,17 +169,18 @@ uses one ViewArea; `mibr-carplay111-noadvertise.senders` lists extra senders (on
 dongle (`model=iPhone9,1`, `osBuildVersion=18D70`) is built in: it never requests stream 111 and
 drops the session when it sees the advertisement.
 
-**Cluster URL content is set by three GEM switches** (*Cluster map turn card / ETA / speed limit
-ON / OFF*), independent of route guidance. Each is a value file in `/mnt/app/root/`; absent = default:
+**Cluster URL content is set by four GEM switches** (*Cluster map turn card / ETA / speed limit /
+compass ON / OFF*), independent of route guidance. Each is a value file in `/mnt/app/root/`; absent = default:
 
 | file `mibr-carplay111-nav.…` | default | values |
 | --- | --- | --- |
 | `showManeuver` | `yes` | `yes` = root URL `maps:/car/instrumentcluster` with the app's turn card; `no` = bare `…/map` surface (the root URL is "anyContent" and keeps the card even with `showETA=no`) |
 | `showETA` | `no` | `yes` / `no` |
 | `showSpeedLimit` | `no` | `yes` / `no` / `user` (follows the iPhone's Maps setting; file only) |
+| `showCompass` | `no` | `yes` / `no` / `user` (follows the iPhone's Maps setting; file only) |
 
-Defaults give `maps:/car/instrumentcluster?showETA=no&showSpeedLimit=no`; turn card off gives
-`maps:/car/instrumentcluster/map?showETA=…&maneuverLayout=no&showSpeedLimit=…`. With our BAP/KDK arrow
+Defaults give `maps:/car/instrumentcluster?showETA=no&showSpeedLimit=no&showCompass=no`; turn card off gives
+`maps:/car/instrumentcluster/map?showETA=…&maneuverLayout=no&showSpeedLimit=…&showCompass=…`. With our BAP/KDK arrow
 active the phone's turn card is therefore shown as well unless the turn-card switch is OFF. A GEM press
 with a session up (`command_ready=1` in `/tmp/mibr-alt111-gen2.status`) re-sends `showUI` through
 `/tmp/mibr-alt111-show-only`; otherwise it applies at the next connection. Java still sends

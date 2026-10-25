@@ -52,8 +52,8 @@ CarPlay or Android Auto automatically.
 - **MMI touchpad → D-pad** so drags navigate CarPlay menus (can be switched off: then
   the touchpad goes to CarPlay the stock way).
 - **AltScreen (optional, experimental).** The CarPlay map video on the cluster. The
-  phone's turn card, ETA and speed limit each switch ON / OFF in the GEM menu (defaults:
-  turn card ON, ETA OFF, speed limit OFF).
+  phone's turn card, ETA, speed limit and compass each switch ON / OFF in the GEM menu
+  (defaults: turn card ON, ETA OFF, speed limit OFF, compass OFF).
   Status and open issues are in
   [`docs/deploy/altscreen-mhi2q.md`](docs/deploy/altscreen-mhi2q.md).
 - **Android Auto.** The Google Maps / Waze map video on the cluster (following the Large,

@@ -203,13 +203,14 @@ typedef void *AirPlayReceiverSessionRef;
 #define ALT_URL_MAP      "maps:/car/instrumentcluster/map"
 #define ALT_URL_INSTRUCTIONCARD "maps:/car/instrumentcluster/instructioncard"
 /*
- * Default URL content is set by three user switches (GEM menu), independent of
+ * Default URL content is set by four user switches (GEM menu), independent of
  * whether our BAP/KDK path draws the maneuver:
  *   mibr-carplay111-nav.showManeuver   yes (default) = root URL, the app's turn card;
  *                                      no = the bare /map surface (the root URL is
  *                                      "anyContent" and keeps the card even with showETA=no)
  *   mibr-carplay111-nav.showETA        no (default) / yes
  *   mibr-carplay111-nav.showSpeedLimit no (default) / yes / user (iPhone setting)
+ *   mibr-carplay111-nav.showCompass    no (default) / yes / user (iPhone setting)
  * No maneuverLayout by default: rightAligned pinned the card to the SafeArea's right
  * edge and the app moved the puck left of it (issue #20; on the Sport skin the card
  * also went behind the rev counter).  mibr-carplay111-nav.maneuverLayout still picks
@@ -943,19 +944,20 @@ static void active_alt_url_copy(char *out, size_t cap)
         char card[8];
         nav_tristate_value(g_nav_eta_path, eta, sizeof(eta), "no");
         nav_tristate_value(g_nav_speed_path, speed, sizeof(speed), "no");
+        nav_tristate_value(g_nav_compass_path, compass, sizeof(compass), "no");
         nav_tristate_value(g_nav_show_maneuver_path, card, sizeof(card), "yes");
         if (strcmp(card, "no") == 0 || strcmp(card, "0") == 0) {
-            snprintf(out, cap, "%s?showETA=%s&maneuverLayout=no&showSpeedLimit=%s",
-                     ALT_URL_MAP, eta, speed);
+            snprintf(out, cap, "%s?showETA=%s&maneuverLayout=no&showSpeedLimit=%s&showCompass=%s",
+                     ALT_URL_MAP, eta, speed, compass);
             return;
         }
         nav_maneuver_value(maneuver, sizeof(maneuver));
         if (maneuver[0])
-            snprintf(out, cap, "%s?showETA=%s&showSpeedLimit=%s&maneuverLayout=%s",
-                     ALT_URL_DEFAULT, eta, speed, maneuver);
+            snprintf(out, cap, "%s?showETA=%s&showSpeedLimit=%s&showCompass=%s&maneuverLayout=%s",
+                     ALT_URL_DEFAULT, eta, speed, compass, maneuver);
         else
-            snprintf(out, cap, "%s?showETA=%s&showSpeedLimit=%s",
-                     ALT_URL_DEFAULT, eta, speed);
+            snprintf(out, cap, "%s?showETA=%s&showSpeedLimit=%s&showCompass=%s",
+                     ALT_URL_DEFAULT, eta, speed, compass);
         return;
     }
     base = nav_surface_url(surface, sizeof(surface));
