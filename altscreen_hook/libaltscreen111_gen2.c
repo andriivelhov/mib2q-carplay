@@ -511,6 +511,16 @@ static uint64_t g2_d2_event_triggers;
 static uint64_t g2_d2_watchdog_triggers;
 static uint64_t g2_d2_coalesced;
 
+/*
+ * suggestUI -> showUI. iOS sends suggestUI (empty url list) when a navigation
+ * app starts guidance and takes the cluster over. Unanswered, that app never got
+ * our URL query: Waze drew no ETA after a reconnect until a GEM switch re-sent
+ * showUI (issue #35). The delay lets the hand-over land first and folds a
+ * suggestUI burst into one showUI.
+ */
+#define G2_RESHOW_DELAY_MS 1000u
+static uint64_t g2_reshow_due_ms;
+
 static void gen2_publish_status(void);
 static void gen2_control_projection_on(void);
 static void gen2_control_release(void);
@@ -3363,6 +3373,7 @@ static void gen2_control_release(void)
     pthread_mutex_lock(&g2_core_lock);
     if(s)(void)alt111_control_end(&g2_control,s);
     g2_control_session=0;
+    g2_reshow_due_ms=0;
     pthread_mutex_unlock(&g2_core_lock);
     gen2_publish_status();
 }
@@ -3639,6 +3650,23 @@ static void gen2_process_diag_markers(void)
     }
 }
 
+/* Due suggestUI answer: queue SHOW in the serialized controller, never out of band. */
+static void gen2_process_reshow(void)
+{
+    int rc;
+    uint64_t now = monotonic_ms();
+    pthread_mutex_lock(&g2_core_lock);
+    if(!g2_reshow_due_ms || now < g2_reshow_due_ms){
+        pthread_mutex_unlock(&g2_core_lock);
+        return;
+    }
+    g2_reshow_due_ms = 0;
+    rc = g2_control_session ? alt111_control_reshow(&g2_control,g2_control_session) : ALT111_STALE;
+    pthread_cond_broadcast(&g2_core_cv);
+    pthread_mutex_unlock(&g2_core_lock);
+    logf_u2("gen2 suggestUI -> showUI reshow rc=%d",rc);
+}
+
 static void *gen2_control_worker(void *arg)
 {
     (void)arg;
@@ -3661,6 +3689,7 @@ static void *gen2_control_worker(void *arg)
         gen2_resync_poll();
         gen2_process_diag_markers();
         gen2_process_map_zoom();
+        gen2_process_reshow();
 
         if(access(g2_reacquire_marker,F_OK)==0){
             unlink(g2_reacquire_marker);
@@ -4056,23 +4085,26 @@ static OSStatus mibr_platform_control(AirPlayReceiverSessionRef session, uint32_
      * Public vehicle-proven MHI2Q AltScreen parity:
      *
      * The Yuedi/LIVI-derived receiver lets stock observe suggestUI, records
-     * stock_rc, but acknowledges the command to the phone with success and
-     * deliberately does NOT translate the suggested URL list into showUI.
+     * stock_rc and acknowledges the command to the phone with success.
      *
      * MU1440 stock returns kNotHandledErr (-6714) because stock has no
      * auxiliary cluster presenter.  Once our private type-111 control session
      * is active, propagating that stock-only error back to iOS is therefore
      * the wrong ownership contract.  Keep every other PlatformControl command
      * stock-authoritative.
+     *
+     * The suggested URL list (empty in every log) is not shown; instead the
+     * worker answers with showUI of our own URL after G2_RESHOW_DELAY_MS.
      */
     if(g_enabled && c && strcmp(c,"suggestUI")==0){
         pthread_mutex_lock(&g2_core_lock);
         private111_active = g2_control_session ? 1 : 0;
+        if(private111_active) g2_reshow_due_ms = monotonic_ms() + G2_RESHOW_DELAY_MS;
         pthread_mutex_unlock(&g2_core_lock);
         if(private111_active){
             gen2_d2_schedule(G2_D2_SOURCE_SUGGEST_UI,"suggestUI");
-            logf_u2("GEN2 PARITY SUGGEST_UI_ACCEPTED session=%p stock_rc=%d return_rc=0 policy=LIVI_NOOP urls_not_shown=1",
-                    session,(int)e);
+            logf_u2("GEN2 PARITY SUGGEST_UI_ACCEPTED session=%p stock_rc=%d return_rc=0 policy=RESHOW delay_ms=%u",
+                    session,(int)e,G2_RESHOW_DELAY_MS);
             return K_NO_ERR;
         }
     }

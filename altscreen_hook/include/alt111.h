@@ -63,6 +63,9 @@ int alt111_control_intent(struct alt111_control *c, unsigned visible, unsigned v
 int alt111_control_keyframe(struct alt111_control *c, uint64_t session);
 /* Explicit operator/validated ownership event only; never video-idle polling. */
 int alt111_control_reacquire(struct alt111_control *c, uint64_t session);
+/* Re-send SHOW (then VIEW and KEYFRAME) without a STOP, so the app iOS hands the
+ * cluster to mid-session gets the current URL. No-op while a SHOW is still due. */
+int alt111_control_reshow(struct alt111_control *c, uint64_t session);
 int alt111_control_next(struct alt111_control *c, uint64_t now_ms,
                        struct alt111_command *out);
 int alt111_control_complete(struct alt111_control *c, uint64_t session,

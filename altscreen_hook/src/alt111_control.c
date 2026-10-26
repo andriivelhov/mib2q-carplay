@@ -81,6 +81,19 @@ int alt111_control_reacquire(struct alt111_control *c, uint64_t session)
     return ALT111_OK;
 }
 
+int alt111_control_reshow(struct alt111_control *c, uint64_t session)
+{
+    if (!c->active || session != c->session) return ALT111_STALE;
+    if (!c->desired) return ALT111_WAIT;
+    /* A SHOW still due (or in flight) builds its URL when it is sent. */
+    if (c->reacquiring || !c->shown_ack) return ALT111_OK;
+    /* A pending VIEW/KEYFRAME completes as usual; SHOW follows it. Like an
+     * explicit reacquire, this new event may clear an exhausted transaction. */
+    if (c->exhausted) cancel(c);
+    c->shown_ack = 0;
+    return ALT111_OK;
+}
+
 int alt111_control_complete(struct alt111_control *c, uint64_t session,
                            uint64_t request, int success, uint64_t now_ms)
 {

@@ -183,7 +183,10 @@ Defaults give `maps:/car/instrumentcluster?showETA=no&showSpeedLimit=no&showComp
 `maps:/car/instrumentcluster/map?showETA=…&maneuverLayout=no&showSpeedLimit=…&showCompass=…`. With our BAP/KDK arrow
 active the phone's turn card is therefore shown as well unless the turn-card switch is OFF. A GEM press
 with a session up (`command_ready=1` in `/tmp/mibr-alt111-gen2.status`) re-sends `showUI` through
-`/tmp/mibr-alt111-show-only`; otherwise it applies at the next connection. Java still sends
+`/tmp/mibr-alt111-show-only`; otherwise it applies at the next connection. When an app starts
+guidance and iOS hands it the cluster, iOS sends `suggestUI`; 1 s later the hook answers with
+`showUI` (then `updateViewArea` and `forceKeyFrame`) so that app gets the current URL too (issue #35:
+without it Waze drew no ETA after a reconnect). Java still sends
 `CMD_ALT_RGI 0x0116` on route-guidance edges; `altscreen111_set_rgi` only logs it.
 
 The turn-card URL carries no `maneuverLayout`: 1.2's `rightAligned` pinned the app's card to the SafeArea's

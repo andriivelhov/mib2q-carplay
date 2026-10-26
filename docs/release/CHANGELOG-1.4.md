@@ -24,6 +24,17 @@ Changes since [1.3.1](CHANGELOG-1.3.1.md).
   GEM switches still do not reach the dongle. Image `dongle/hw301/fw/hw301_v1167.tar`
   (marker `v1167-20261025192423`). *Car test pending.*
 
+## Fixed
+
+- **Cluster map ETA missing after a reconnect until the switch was toggled (issue #35).** The
+  ETA (and the speed limit and compass) settings reached only the app that drew the cluster at
+  connect time. When Waze started guidance later, iOS handed it the cluster with a `suggestUI`,
+  which the hook acknowledged but never answered, so Waze drew no ETA although the switch was ON.
+  The hook now answers `suggestUI` 1 s later with `showUI` and the current URL, followed by
+  `updateViewArea` and `forceKeyFrame`, in the same order as at session start. A burst of
+  `suggestUI` gives one `showUI`. `altscreen111.log`: `policy=RESHOW` and
+  `gen2 suggestUI -> showUI reshow rc=0`. *Car test pending.*
+
 ## Documentation
 
 - [altscreen-mhi2q](../deploy/altscreen-mhi2q.md): the compass switch is added to the cluster
