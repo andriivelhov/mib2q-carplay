@@ -36,7 +36,10 @@
  *   ALTR_DISPLAYABLE_ID (default 99)                         [QNX]
  *   ALTR_LIVE_FILE  (default /tmp/altscreen_render.live)
  *   ALTR_STATUS_FILE(default /tmp/altscreen_render.status)
- *   ALTR_LIVE_TIMEOUT_MS (default 500) — .live removed if no frame within this
+ *   ALTR_LIVE_TIMEOUT_MS (default 0 = while connected) — .live removed if no frame
+ *                   within this. Apple Maps without a route sends no picture for
+ *                   seconds at a time (car log: 5.5 s gap), and 500 ms dropped the
+ *                   cluster to the Audi map; the tee closing ends the stream
  *   ALTR_AA_LIVE_TIMEOUT_MS (default 0 = while connected) — same for Android Auto,
  *                   which sends almost no pictures while its map does not change
  *                   (car log 020: one picture every ~6 s), so a picture gap is not
@@ -54,6 +57,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -246,6 +250,12 @@ static int tee_connect(const char *host, int port)
     sa.sin_port = htons((uint16_t)port);
     sa.sin_addr.s_addr = inet_addr(host);
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) { close(fd); return -1; }
+    {
+        /* Matches the hook end: no Nagle, room for a burst while decoding stalls. */
+        int one = 1, rcvbuf = 256 * 1024;
+        (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    }
     return fd;
 }
 
@@ -596,6 +606,21 @@ static void hw_give_up(struct app *a, const char *why)
     hw_close(a);
 }
 
+/* Account for pictures the hardware decoder has shown since the last check. */
+static void hw_poll_frames(struct app *a, const struct source *s)
+{
+    uint64_t hf = altr_hwdec_frames(a->hw);
+    if (hf <= a->hw_frames_seen) return;
+    if (a->hw_frames_seen == 0) hw_starts_clear(s);   /* decoder works */
+    a->frames += hf - a->hw_frames_seen;
+    a->hw_frames_seen = hf;
+    a->last_w = s->view.view_w; a->last_h = s->view.view_h;
+    a->last_frame_ms = a->last_shown_ms = now_ms();
+    set_live(1);
+    if (a->frames <= 2 || (a->frames % 120) == 0)
+        write_status("decoding_hw", a->last_w, a->last_h, a->frames);
+}
+
 /* The software path draws with GLES on its own window 99; bring it back if the
  * hardware path had it. */
 static int ensure_gl(struct app *a)
@@ -622,7 +647,7 @@ static void sources_init(struct source *src, int *nsrc, int surface_w, int surfa
     src[*nsrc].view.stream_w = src[*nsrc].view.view_w = surface_w;
     src[*nsrc].view.stream_h = src[*nsrc].view.view_h = surface_h;
     src[*nsrc].view.crop_x = src[*nsrc].view.crop_y = 0;
-    src[*nsrc].live_timeout_ms = env_i("ALTR_LIVE_TIMEOUT_MS", 500);
+    src[*nsrc].live_timeout_ms = env_i("ALTR_LIVE_TIMEOUT_MS", 0);
     src[*nsrc].hw_off_marker = ALTR_HWDEC_OFF_MARKER;
     src[*nsrc].hw_off_boot = ALTR_HWDEC_OFF_BOOT;
     src[*nsrc].hw_settle_marker = ALTR_HW_SETTLE_MARKER;
@@ -826,7 +851,6 @@ int main(void)
                     }
                 }
                 if (a.hw) {
-                    uint64_t hf;
                     int rc;
                     wd_arm(s, "decode", ALTR_WD_FEED_MS, a.live_hold_until_ms);
                     rc = altr_hwdec_feed(a.hw, buf, (size_t)n);
@@ -836,17 +860,7 @@ int main(void)
                         ensure_gl(&a);
                         break;
                     }
-                    hf = altr_hwdec_frames(a.hw);
-                    if (hf > a.hw_frames_seen) {
-                        if (a.hw_frames_seen == 0) hw_starts_clear(s);   /* decoder works */
-                        a.frames += hf - a.hw_frames_seen;
-                        a.hw_frames_seen = hf;
-                        a.last_w = s->view.view_w; a.last_h = s->view.view_h;
-                        a.last_frame_ms = a.last_shown_ms = now_ms();
-                        set_live(1);
-                        if (a.frames <= 2 || (a.frames % 120) == 0)
-                            write_status("decoding_hw", a.last_w, a.last_h, a.frames);
-                    }
+                    hw_poll_frames(&a, s);
                     continue;
                 }
                 if (!a.have_gl && ensure_gl(&a) != 0) continue;
@@ -855,6 +869,11 @@ int main(void)
             } else if (r < 0 && errno != EINTR) {
                 break;
             }
+#ifdef PLATFORM_QNX
+            /* Pictures come out of the hardware decoder asynchronously; count one
+             * on the idle tick too, not only when the next input arrives. */
+            if (a.hw) hw_poll_frames(&a, s);
+#endif
             /* Heartbeat while the last picture is recent (or, timeout 0, for the
              * whole connection): Android Auto sends almost no pictures while its
              * map is still, and that must not drop ctx 81/82. */

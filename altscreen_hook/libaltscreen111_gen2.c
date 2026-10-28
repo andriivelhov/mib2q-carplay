@@ -11,6 +11,8 @@
 #include <string.h>
 #include <stdarg.h>
 #include <sys/mman.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1705,23 +1707,56 @@ static int gen2_video_config(const uint8_t *p, size_t n)
     return rc;
 }
 
+/* Skip-to-IDR after a queue overflow: ask for a keyframe again every
+ * G2_SKIP_RETRY_MS; after G2_SKIP_GIVEUP_MS without one, restart the consumer
+ * as before so the cluster can never stay frozen on the last picture. */
+#define G2_SKIP_RETRY_MS 1000u
+#define G2_SKIP_GIVEUP_MS 5000u
+static uint64_t g2_skip_since_ms, g2_skip_request_ms;
+static void gen2_keyframe_intent(void);
+
 static int gen2_video_submit_au(const uint8_t *p, size_t n, int *accepted, int *consumer_attached)
 {
     int rc;
-    uint64_t before, after_count;
+    unsigned awaiting;
+    uint64_t before, after_count, now;
     if (accepted) *accepted = 0;
     if (consumer_attached) *consumer_attached = 0;
     pthread_mutex_lock(&g2_core_lock);
     before = g2_video.source_aus;
     rc = g2_video_stream ? alt111_video_submit(&g2_video, g2_video_stream, p, n, 1) : ALT111_STALE;
     after_count = g2_video.source_aus;
+    awaiting = g2_video.attached && g2_video.awaiting_idr;
     if (accepted && after_count > before) *accepted = 1;
     if (consumer_attached) *consumer_attached = g2_video.attached ? 1 : 0;
     pthread_cond_broadcast(&g2_core_cv);
     pthread_mutex_unlock(&g2_core_lock);
     if (rc == ALT111_RESTART_CONSUMER || rc < 0) {
         logf_u2("gen2 video AU rc=%d body=%zu -> consumer reset", rc, n);
+        g2_skip_since_ms = 0;
         gen2_close_consumer();
+        return rc;
+    }
+    if (!awaiting) {
+        if (g2_skip_since_ms)
+            logf_u2("gen2 video IDR after %llu ms -> resumed",
+                    (unsigned long long)(monotonic_ms() - g2_skip_since_ms));
+        g2_skip_since_ms = 0;
+        return rc;
+    }
+    now = monotonic_ms();
+    if (rc == ALT111_SKIP_TO_IDR) {
+        /* Returned once per overflow; later non-IDR pictures return WAIT. */
+        logf_u2("gen2 video queue full body=%zu -> dropped unsent, waiting for IDR", n);
+        g2_skip_since_ms = g2_skip_request_ms = now;
+        gen2_keyframe_intent();
+    } else if (g2_skip_since_ms && now - g2_skip_since_ms >= G2_SKIP_GIVEUP_MS) {
+        logf_u2("gen2 video no IDR %u ms after overflow -> consumer reset", G2_SKIP_GIVEUP_MS);
+        g2_skip_since_ms = 0;
+        gen2_close_consumer();
+    } else if (g2_skip_since_ms && now - g2_skip_request_ms >= G2_SKIP_RETRY_MS) {
+        g2_skip_request_ms = now;
+        gen2_keyframe_intent();
     }
     return rc;
 }
@@ -1970,7 +2005,13 @@ static void *tee_accept_thread(void *arg)
         if (c < 0) { if (errno == EINTR) continue; sleep(1); continue; }
         {
             int flags = fcntl(c, F_GETFL, 0);
+            /* No Nagle: a small picture must not wait for the previous one's ACK.
+             * A larger send buffer gives the renderer slack before the queue
+             * fills (failures are harmless: the stack keeps its defaults). */
+            int one = 1, sndbuf = 256 * 1024;
             if (flags >= 0) (void)fcntl(c, F_SETFL, flags | O_NONBLOCK);
+            (void)setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            (void)setsockopt(c, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
         }
         pthread_mutex_lock(&g_lock);
         tee_drop_client_locked();

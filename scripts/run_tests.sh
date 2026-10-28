@@ -106,6 +106,11 @@ cc -std=c99 -O2 -Wall -Wextra -Werror -pedantic -Ialtscreen_render \
     tests/altscreen_view_test.c altscreen_render/view.c -o "$OUT/altscreen_view"
 "$OUT/altscreen_view"
 
+printf '%-32s ' alt111_video_test
+cc -std=c99 -O2 -Wall -Wextra -Werror -pedantic -Ialtscreen_hook/include \
+    tests/alt111_video_test.c altscreen_hook/src/alt111_video.c -o "$OUT/alt111_video"
+"$OUT/alt111_video"
+
 printf '%-32s ' aa_navxlate_test
 cc -std=gnu99 -O1 -Wall -Wextra -Werror -Wno-unused-function \
     tests/aa_navxlate_test.c -o "$OUT/aa_navxlate"
