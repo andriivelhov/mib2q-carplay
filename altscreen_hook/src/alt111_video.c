@@ -3,6 +3,11 @@
 #include <string.h>
 
 static const uint8_t start_code[4] = {0, 0, 0, 1};
+/* Access unit delimiter appended after every picture. FFmpeg's H.264 parser
+ * (both renderer decode paths) only completes a picture when it sees the start
+ * of the next one; with sparse senders (Apple Maps without a route: gaps of
+ * several seconds) each picture was shown one whole gap late. */
+static const uint8_t trailing_aud[6] = {0, 0, 0, 1, 9, 0xf0};
 
 static void clear_queue(struct alt111_video *v)
 {
@@ -14,6 +19,24 @@ static void clear_queue(struct alt111_video *v)
     v->head = v->count = 0; v->queued_bytes = 0;
 }
 
+/* Overflow recovery without a consumer restart: drop every queued picture that
+ * has not started on the wire. The head chunk stays when it is partly written,
+ * so the renderer's byte stream keeps its framing. A dropped priming chunk
+ * re-arms priming so the next IDR carries SPS/PPS again. */
+static void drop_unsent(struct alt111_video *v)
+{
+    unsigned keep = v->count && v->queue[v->head].offset ? 1u : 0u, i, index;
+    for (i = keep; i < v->count; ++i) {
+        index = (v->head + i) % ALT111_QUEUE_CAP;
+        if (v->queue[index].priming) v->priming_queued = 0;
+        v->queued_bytes -= v->queue[index].length;
+        free(v->queue[index].bytes);
+        memset(&v->queue[index], 0, sizeof(v->queue[index]));
+        ++v->dropped_aus;
+    }
+    v->count = keep;
+}
+
 void alt111_video_init(struct alt111_video *v) { memset(v, 0, sizeof(*v)); }
 
 void alt111_video_detach(struct alt111_video *v)
@@ -21,7 +44,7 @@ void alt111_video_detach(struct alt111_video *v)
     clear_queue(v);
     ++v->consumer;
     v->attached = v->priming_queued = v->consumer_primed = 0;
-    v->keyframe_needed = 0;
+    v->keyframe_needed = v->awaiting_idr = 0;
 }
 
 void alt111_video_destroy(struct alt111_video *v)
@@ -203,17 +226,29 @@ int alt111_video_submit(struct alt111_video *v, uint64_t stream,
         bytes += 4 + len; pos += len;
     }
     if ((!idr && !dependent) || (idr && dependent)) return invalid_au(v);
+    bytes += sizeof(trailing_aud);
     ++v->source_aus; v->source_idrs += idr;
     if (!v->attached) return ALT111_WAIT;
     if (!v->consumer_primed && !v->priming_queued && !idr) {
         ++v->dropped_aus;
         return ALT111_WAIT;
     }
+    if (v->awaiting_idr) {
+        if (!idr) { ++v->dropped_aus; return ALT111_WAIT; }
+        v->awaiting_idr = 0;
+    }
     prefix = !v->consumer_primed && !v->priming_queued ? v->config_length : 0;
     if (v->count == ALT111_QUEUE_CAP || bytes + prefix > ALT111_QUEUE_BYTES - v->queued_bytes) {
-        ++v->dropped_aus;
-        alt111_video_detach(v);
-        return ALT111_RESTART_CONSUMER;
+        /* The renderer fell behind. Closing the consumer would blank the
+         * cluster and reopen the decoder; instead skip to the next IDR. */
+        drop_unsent(v);
+        prefix = !v->consumer_primed && !v->priming_queued ? v->config_length : 0;
+        if (!idr || v->count == ALT111_QUEUE_CAP ||
+            bytes + prefix > ALT111_QUEUE_BYTES - v->queued_bytes) {
+            ++v->dropped_aus;
+            v->awaiting_idr = 1;
+            return ALT111_SKIP_TO_IDR;
+        }
     }
     out = (uint8_t *)malloc(prefix + bytes);
     if (!out) { alt111_video_detach(v); ++v->dropped_aus; return ALT111_NOMEM; }
@@ -227,6 +262,7 @@ int alt111_video_submit(struct alt111_video *v, uint64_t stream,
         memcpy(out + used, start_code, 4); used += 4;
         memcpy(out + used, p + pos, len); used += len; pos += len;
     }
+    memcpy(out + used, trailing_aud, sizeof(trailing_aud)); used += sizeof(trailing_aud);
     index = (v->head + v->count) % ALT111_QUEUE_CAP;
     chunk = &v->queue[index];
     chunk->bytes = out; chunk->length = used; chunk->offset = 0;

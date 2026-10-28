@@ -9,7 +9,7 @@
 
 #define ALT111_MAX_VIEWS 3
 #define ALT111_CODEC_CAP 4096
-#define ALT111_QUEUE_CAP 16
+#define ALT111_QUEUE_CAP 64
 #define ALT111_AU_LIMIT (2u * 1024u * 1024u)
 #define ALT111_QUEUE_BYTES (4u * 1024u * 1024u)
 #define ALT111_COMMAND_TIMEOUT_MS 1500u
@@ -18,6 +18,7 @@
 
 enum alt111_result {
     ALT111_OK = 0, ALT111_WAIT = 1, ALT111_RESTART_CONSUMER = 2,
+    ALT111_SKIP_TO_IDR = 3, /* queue overflowed: unsent pictures dropped, consumer kept */
     ALT111_INVALID = -1, ALT111_STALE = -2, ALT111_BUSY = -3,
     ALT111_NOMEM = -4
 };
@@ -150,6 +151,7 @@ struct alt111_video {
     uint64_t session, stream, codec, consumer, sequence;
     unsigned active, attached, config_valid, config_blocked, nal_length_size;
     unsigned priming_queued, consumer_primed, keyframe_needed;
+    unsigned awaiting_idr; /* after an overflow drop, forward nothing until an IDR */
     uint8_t config[ALT111_CODEC_CAP];
     size_t config_length, queued_bytes;
     struct alt111_chunk queue[ALT111_QUEUE_CAP];
