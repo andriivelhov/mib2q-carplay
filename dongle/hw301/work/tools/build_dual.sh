@@ -4,9 +4,9 @@
 #
 #   build_dual.sh [target]      target = release | release-input | optA | optA-input
 #
-#   release        -> hw301_v1172.tar  native proxy candidate, diagnostics off
+#   release        -> hw301_v1176.tar  native proxy + route guidance bridge, diagnostics off
 #   release-input  -> hw301_v1174.tar  Input ChaCha key diagnostic
-#   optA           -> hw301_v1173.tar  native proxy candidate + logging
+#   optA           -> hw301_v1177.tar  native proxy + route guidance bridge + logging
 #   optA-input     -> hw301_v1175.tar  logging + Input key diagnostic
 #
 # Every target replaces the single-screen proxy boundary. Stream 111 uses
@@ -26,9 +26,9 @@ build_step() {
 }
 
 case "${1:-release}" in
-  release)       build_step 1172 "-DCLUSTER_DIAG=0" ;;
+  release)       build_step 1176 "-DCLUSTER_DIAG=0" ;;
   release-input) build_step 1174 "-DCLUSTER_DIAG=0 -DCLUSTER_KEY_INPUT=1" ;;
-  optA)          build_step 1173 ;;
+  optA)          build_step 1177 ;;
   optA-input)    build_step 1175 "-DCLUSTER_KEY_INPUT=1" ;;
   *) echo "usage: $0 [release|release-input|optA|optA-input]"; exit 1 ;;
 esac

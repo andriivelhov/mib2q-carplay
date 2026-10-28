@@ -59,7 +59,7 @@ stock v129 functions and observations:
 | Car command handler `_ProcessProxyRequestCommand` 0x36b38 | Unknown commands are forwarded to an existing phone session. Earlier notes claiming they were always dropped were incomplete. Capture cluster commands before this handler so they also survive a temporarily absent phone. |
 | Phone control delegate `FUN_0005854c` | Generic commands are wrapped as `{type, params}` and forwarded with `AirplayClientSendCmdCmd`; this includes suggestUI. No new private reverse channel is needed. |
 
-The build pins CPAAProxyEx, libAirPlay and libCoreUtils to the inspected stock
+The build pins CPAAProxyEx, libAirPlay, libCoreUtils and libiAP2Link to the inspected stock
 v129 hashes using `work/tools/check_native_abi.py`. The phone pairing-session
 pointer at session +0x3ec remains a private v129 ABI dependency.
 
@@ -134,6 +134,57 @@ The head-unit transport uses `poll()` for the legacy control send/listener path,
 sets `ETIMEDOUT` on a send timeout, and leaves native phone/proxy reads blocking.
 Legacy controls are serviced while video is idle. Descriptor numbers above the
 QNX `FD_SETSIZE` limit no longer suppress those reads or listener polling.
+
+### Route guidance bridge (v1176)
+
+Route guidance (iAP2 0x5200-0x5204: HUD maneuvers and the cluster arrow) never
+worked through the dongle, on any image. Dongle log 2026-10-28: the car, with the
+head-unit hook, sends StartRouteGuidanceUpdate `0x5200` every 2 s and then every
+30 s (the hook's retry). Stock never forwards it, and the phone never sends `0x5201`/`0x5202`.
+Stock v129 relays iAP2 between the car (USB link, the dongle is the device) and
+the phone (iAP over CarPlay, the dongle is the accessory) from fixed tables:
+
+| Boundary | Evidence |
+| --- | --- |
+| Car to phone, `iap2_dev_recv_data` 0x3ee7c | Switch on the message ID (0x3f120-0x3f590). Only 0x4154-0x4164, 0x10da-0x10dd, 0x4c00-0x4c09, 0x5000-0x5003 and a few others reach the phone (`iAP2LinkQueueSendData(gOverCarplayLink, ..., gOverCarPlayCtrlSession)`). 0x52xx falls to the default and is dropped. |
+| Phone to car, handler 0x5eec4 | Range check before `iap2_send_message_to_proxy_usb(buf, len, 0)`. 0x5201/0x5202/0x5204 are dropped. |
+| Phone Identify, 0x1d00 case | `_makeiAP2IdInfoMessage` 0x5ed9c writes parameters `00 01 02 03 04 05 06 07 08 09 0c 0d 10 11 12 14 16 18` (no 0x1E) with the fixed lists `CPSendIAP2MsgIds` (29 IDs) and `CPRecvIAP2MsgIds` (13), with no 0x52xx. Component IDs used: USB host 1, Bluetooth 2, vehicle information 3, wireless CarPlay 4. |
+| Start cache, `.rodata` 0x152014 | `{start, stop}` pairs (4154/4156, 4157/4159, 4170/4172, 10da/10dc, 4c00/4c02, 4c03/4c05, 5000/5002). `iap2_set_overcarplay_linksession` replays these starts to a new phone link (`rewrite start msg id`). |
+
+The bridge in `cluster_dual.c` wraps only libiAP2Link imports. That library is
+loaded after the shim and is not `-Bsymbolic`; `iAP2LinkRunLoopCreateDevice`
+reaches `iAP2LinkRunLoopCreate` through its PLT.
+
+- `iAP2LinkRunLoopCreate` (type 1 = car, 0 = phone; the data callback is the
+  sixth argument) swaps the stock callbacks `iap2_dev_recv_data` and
+  `CarPlayIAP2Session::iAP2LinkDataReadyCB` for wrappers. Other links (Bluetooth,
+  HID) keep their callbacks. The stock callback still sees every message.
+- From the car's Identify the bridge keeps the 0x1E RouteGuidanceDisplayComponent
+  verbatim (component 0x0010 from the hook). The phone 0x1d00 reply is rewritten in
+  `iAP2LinkQueueSendData`: 0x5200/0x5203 are added to list 6, 0x5201/0x5202/0x5204
+  to list 7, and the car's component is appended. A car without the component, an
+  unexpected layout or no room leaves the stock Identify. If the phone rejects the
+  Identify (0x1d03), the bridge turns itself off until the next restart.
+- Car 0x5200/0x5203 go to the phone exactly like stock's own forwards. The last
+  0x5200 is kept and replayed when stock attaches a new phone link, as it does for its
+  own start cache. A new car Identify or 0x5203 clears it.
+- Phone 0x5201/0x5202/0x5204 go to the car through `iap2_send_message_to_proxy_usb`,
+  reassembled across link packets in the same way the stock handler does.
+- Off: `-DCLUSTER_RGD=0`, `/mnt/UDISK/cluster_rgd.off`, or the shim's global off switch.
+  Log lines start with `cluster_dual: rgd`; `rgd bridge on create=1 send=1 car=1 phone=1`
+  confirms the binding at startup.
+
+`check_native_abi.py` now also pins `lib/libiAP2Link.so` (argument order of
+`iAP2LinkRunLoopCreate`). The host tests cover the Identify rewrite and its
+refusals, the cached start and its replay, the split maneuver message, the other
+session being ignored, the rejection fallback and no rewrite outside the phone callback.
+First car test 2026-10-28 (dongle log `work/logs/applogs-2026-10-28_10-15-25-*.tar`,
+~91 s session): `rgd car component=0x0010 len=86`; five car 0x5200 kept before the
+phone link; phone Identify 361 -> 457 bytes, accepted (no 0x1d03); the cached 0x5200
+replayed at 18.1 s; phone 0x5201, 0x5204 and 0x5202 relayed to the car from 64 s, after
+which the car stopped retrying. The cluster stream ran alongside (1,047 frames, `bad=0
+dropped=0 send_err=0`). Not yet covered: a long route, rerouting, phone Wi-Fi reconnect
+mid-route (replay path) and a head-unit log of the same session.
 
 ### Validation and build
 
@@ -264,6 +315,9 @@ no head-unit logs were saved.
 - Shim lines written to `app.log` after startup are lost. **Log to `/dev/kmsg`** and read
   `dmesg.log` from `getlogs.py`. The kmsg ring is small, so pull logs right after a test,
   before unplugging the dongle.
+- `app.log` (`/mnt/UDISK/logs`, ~256 KB ring) survives power cycles. It apparently does not
+  survive a `/getlogs` pull: the 2026-10-28 pull held only the 3 boots since the 2026-10-27
+  pull, which had held 7.
 
 ## Historical v1167 phone side (dongle = AirPlay receiver)
 
@@ -403,11 +457,16 @@ of frames, `nal_ok=1 bad=0`):
 | **1166** | release: v1164 + no ETA (`showETA=no`) + `KEYF` back-channel key frame requests and a late key frame 3 s after the relay attaches; fixes the blank cockpit map after a cold start (`build_dual.sh release`, `v1166-20261021090922`). *Car test pending* | archived `fw/hw301_v1166.tar` |
 | **1167** | release: v1166 + per-layout URL: wide = ETA, speed limit and compass; classic / Sport = turn card only; `showUI` on a layout change (`build_dual.sh release`, `v1167-20261025192423`). *Car test pending* | archived `fw/hw301_v1167.tar` |
 | 1168-1171 | private `hw301Cluster` `/info` extension, HELLO/KEY1 rekey and URL1 back-channel (release, optA and Input-key variants) | superseded by 1172, not shipped |
-| **1172** | native proxy: car display and commands passed through, own 111 ID/port/AES, `model=HW301` with stock `18D70` (`build_dual.sh release`, `v1172-20261027093548`). First car pass 2026-10-27 (as 1173) | **newest image**, `fw/hw301_v1172.tar` |
+| **1172** | native proxy: car display and commands passed through, own 111 ID/port/AES, `model=HW301` with stock `18D70` (`build_dual.sh release`, `v1172-20261027093548`). First car pass 2026-10-27 (as 1173) | last car-tested image, `fw/hw301_v1172.tar` |
 | 1173 | **same version as v1172**, also contains enabled logging (`build_dual.sh optA`, `v1173-20261027093537`). First car pass 2026-10-27 | `fw/hw301_v1173.tar` |
+| **1176** | v1172 + route guidance bridge (`build_dual.sh release`, `v1176-20261028100645`). First car pass 2026-10-28 | **newest image**, `fw/hw301_v1176.tar` |
+| 1177 | **same version as v1176**, also contains enabled logging (`build_dual.sh optA`, `v1177-20261028100705`) | `fw/hw301_v1177.tar` |
 
 ## Open items
 
+- **Route guidance bridge (v1176/v1177), remaining part.** The first pass worked. Still open:
+  a long route with rerouting, phone Wi-Fi loss mid-route (the cached 0x5200 replay) and a
+  head-unit log in the same session.
 - **Main-screen validation, remaining part.** The 2026-10-27 test confirmed MMI
   CarPlay, Siri, calls and prompts with the candidate identity and the SETUP before
   `/info` order. Unplug/replug and phone Wi-Fi loss/reconnect are still open.

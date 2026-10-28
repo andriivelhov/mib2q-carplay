@@ -53,6 +53,19 @@ Changes since [1.3.1](CHANGELOG-1.3.1.md).
     switching, the menu switches, unplug/replug and phone Wi-Fi loss.
   - The v1167 image keeps working with the 1.4 head unit, unchanged.
 
+- **HW301 image v1176: route guidance works through the dongle.** The HUD maneuvers and the
+  cluster maneuver arrow now work with the HW301 as with a cable-connected iPhone. The stock
+  dongle firmware never passed CarPlay route guidance on: it dropped the car's request to start
+  it and did not announce it to the iPhone. v1176 copies the car's route guidance announcement
+  to the iPhone and relays the start/stop requests and the iPhone's maneuver, lane and route
+  updates. If the iPhone ever refuses the announcement, the dongle drops it until the next
+  restart, so CarPlay keeps working as before.
+  - Image `dongle/hw301/fw/hw301_v1176.tar` (marker `v1176-20261028100645`), now the newest
+    HW301 image; `dongle/hw301/fw/hw301_v1177.tar` (marker `v1177-20261028100705`) is the same
+    version with diagnostic logging. Otherwise identical to v1172.
+  - First car test on 2026-10-28: Apple Maps maneuvers, lane guidance and route updates
+    reached the car; the cluster map kept running (no bad or dropped frames).
+
 ## Changed
 
 - **The head unit no longer needs to recognise the HW301.** The v1172 image uses the normal
@@ -95,7 +108,8 @@ Changes since [1.3.1](CHANGELOG-1.3.1.md).
 - [altscreen-mhi2q](../deploy/altscreen-mhi2q.md): the compass and the wide-view switches are
   added to the cluster URL switch table; the HW301 v1172 identity next to the legacy one.
 - [hw301-dongle](../deploy/hw301-dongle.md), dongle README and FINDINGS: v1167 and its
-  per-layout URLs; the v1172 design, its build and the first car test.
+  per-layout URLs; the v1172 design, its build and the first car test; the v1176 route
+  guidance bridge.
 
 ## Updating from 1.3.1
 
@@ -104,5 +118,5 @@ Copy both `carplay/` **and** `mod/` to the card, because the menu has new button
 **Install / update CarPlay** button updates the program files but not the menu, so the new
 buttons appear only after the M.I.B. run.
 
-HW301 users: update the head unit first. Then flash `fw/hw301_v1172.tar` on the bench, or keep
-v1167, which works as before.
+HW301 users: update the head unit first. Then flash `fw/hw301_v1176.tar` on the bench, or keep
+v1172 or v1167, which work as before (without route guidance).

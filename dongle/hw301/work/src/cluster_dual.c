@@ -1823,6 +1823,296 @@ void AirPlayReceiverSessionTearDown(void *session, CFRef request, OSStatus reaso
     if (stock) cf_release(stock);
 }
 
+/* ============ ROUTE GUIDANCE (iAP2 0x5200-0x5204) ============
+ * Stock CPAAProxyEx relays iAP2 between the car (USB link, the dongle is the
+ * device) and the phone (iAP over CarPlay, the dongle is the accessory) from
+ * fixed tables. The phone Identify (CPSendIAP2MsgIds / CPRecvIAP2MsgIds) has no
+ * route guidance, and both relays drop 0x52xx. With the head-unit hook the car
+ * Identify carries RouteGuidanceDisplayComponent (0x1E) and the car keeps
+ * sending StartRouteGuidanceUpdate (0x5200), which never reaches the phone.
+ * The bridge copies the car's 0x1E component and the five message IDs into the
+ * phone Identify, relays the car's start/stop to the phone and the phone's
+ * updates to the car. It wraps libiAP2Link imports only; every message still
+ * reaches the stock handler, which drops 0x52xx itself. */
+#ifndef CLUSTER_RGD
+#define CLUSTER_RGD 1
+#endif
+#define RGD_OFF_FILE "/mnt/UDISK/cluster_rgd.off"
+
+#define IAP_ID_START 0x1d00
+#define IAP_ID_INFO 0x1d01
+#define IAP_ID_REJECTED 0x1d03
+#define RGD_START 0x5200
+#define RGD_UPDATE 0x5201
+#define RGD_MANEUVER 0x5202
+#define RGD_STOP 0x5203
+#define RGD_LANE 0x5204
+#define ID_SENT_BY_ACC 6         /* Identify list: messages the accessory sends */
+#define ID_RECV_BY_ACC 7         /* Identify list: messages the accessory receives */
+#define ID_RGD_COMPONENT 0x1e
+#define RGD_COMP_CAP 512
+#define RGD_START_CAP 256
+#define IAP_MSG_CAP 65535u
+#define ID_OUT_CAP (4096 + RGD_COMP_CAP + 16)   /* stock builds the Identify in 4 KiB */
+#define RGD_LOG_EVERY 500
+
+typedef int (*iap_ready_fn)(void *link, uint8_t *data, uint32_t len, uint8_t session);
+typedef int (*iap_send_fn)(void *link, const uint8_t *data, uint32_t len, uint8_t session,
+                           void *ctx, void *done);
+/* libiAP2Link v129: type 1 = device link (car, via iAP2LinkRunLoopCreateDevice),
+ * 0 = accessory link (phone). The data callback is the sixth argument for both. */
+typedef void *(*iap_rl_create_fn)(int type, void *ctx, void *syn, void *send, void *send2,
+                                  iap_ready_fn ready, void *connected, void *detect,
+                                  int validate, int max_packets, void *buf);
+
+static iap_rl_create_fn r_rl_create;
+static iap_send_fn r_queue_send;
+static iap_ready_fn r_car_ready, r_phone_ready;  /* iap2_dev_recv_data, CarPlayIAP2Session::iAP2LinkDataReadyCB */
+static void (*r_to_car)(const uint8_t *, uint32_t, int);  /* iap2_send_message_to_proxy_usb */
+static void *const *r_cp_link;                   /* gOverCarplayLink: set after the phone's 0x4E09, NULL at stop */
+static const uint8_t *r_cp_ctrl;                 /* gOverCarPlayCtrlSession */
+
+static pthread_once_t g_rgd_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_rgd_lock = PTHREAD_MUTEX_INITIALIZER;
+static __thread int t_rgd_phone;                 /* inside the stock phone data callback */
+static struct {
+    int off;                                     /* build flag, off file, missing symbol or a phone rejection */
+    uint8_t comp[RGD_COMP_CAP];                  /* car's 0x1E parameter, verbatim */
+    size_t comp_len;
+    uint8_t start[RGD_START_CAP];                /* car's last 0x5200, replayed to a new phone link */
+    size_t start_len;
+    int phone_ok;                                /* the current phone Identify carried the component */
+    unsigned logged, to_car;
+    /* Phone updates can span link packets. Only the phone callback (one stock
+     * run loop thread) touches these. */
+    uint8_t rx[IAP_MSG_CAP];
+    uint32_t rx_have, rx_want;
+    uint8_t rx_session;
+} g_rgd;
+
+static unsigned be16(const uint8_t *p) { return (unsigned)p[0] << 8 | p[1]; }
+static void put_be16(uint8_t *p, unsigned v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+
+/* ID of one complete iAP2 control message (0x4040, BE16 length, BE16 ID), else 0. */
+static unsigned iap_msg_id(const uint8_t *m, uint32_t n) {
+    if (!m || n < 6 || m[0] != 0x40 || m[1] != 0x40 || be16(m + 2) != n) return 0;
+    return be16(m + 4);
+}
+
+/* Parameter `id` of a well-formed message, header included; NULL otherwise. */
+static const uint8_t *iap_param(const uint8_t *m, size_t n, unsigned id, size_t *len) {
+    size_t off = 6;
+    while (off + 4 <= n) {
+        size_t pl = be16(m + off);
+        if (pl < 4 || off + pl > n) return NULL;
+        if (be16(m + off + 2) == id) { *len = pl; return m + off; }
+        off += pl;
+    }
+    return NULL;
+}
+
+static int list_has(const uint8_t *p, size_t pl, unsigned id) {
+    size_t i;
+    for (i = 4; i + 2 <= pl; i += 2) if (be16(p + i) == id) return 1;
+    return 0;
+}
+
+/* The phone Identify `m` plus the car's route guidance component and message
+ * IDs, written to `out`. 0 sends the stock Identify unchanged. */
+static size_t rgd_patch_identify(const uint8_t *m, size_t n, const uint8_t *comp, size_t comp_len,
+                                 uint8_t *out, size_t cap) {
+    static const uint16_t sent[] = { RGD_START, RGD_STOP };
+    static const uint16_t recv[] = { RGD_UPDATE, RGD_MANEUVER, RGD_LANE };
+    size_t off = 6, o = 6, i;
+    int lists = 0;
+    if (iap_msg_id(m, (uint32_t)n) != IAP_ID_INFO || comp_len < 4) return 0;
+    if (n + comp_len + 2 * 5 > cap || n + comp_len + 2 * 5 > IAP_MSG_CAP) return 0;
+    memcpy(out, m, 6);
+    while (off < n) {
+        const uint16_t *add = NULL;
+        size_t nadd = 0, pl, grown;
+        unsigned id;
+        if (off + 4 > n) return 0;
+        pl = be16(m + off);
+        id = be16(m + off + 2);
+        if (pl < 4 || off + pl > n || id == ID_RGD_COMPONENT) return 0;
+        if (id == ID_SENT_BY_ACC) { add = sent; nadd = 2; lists |= 1; }
+        if (id == ID_RECV_BY_ACC) { add = recv; nadd = 3; lists |= 2; }
+        memcpy(out + o, m + off, pl);
+        for (grown = pl, i = 0; i < nadd; ++i)
+            if (!list_has(m + off, pl, add[i])) { put_be16(out + o + grown, add[i]); grown += 2; }
+        put_be16(out + o, (unsigned)grown);
+        o += grown;
+        off += pl;
+    }
+    if (lists != 3) return 0;
+    memcpy(out + o, comp, comp_len);
+    o += comp_len;
+    put_be16(out + 2, (unsigned)o);
+    return o;
+}
+
+static int rgd_send_phone(const uint8_t *m, size_t n) {
+    void *link = r_cp_link ? *r_cp_link : NULL;
+    if (!link || !r_queue_send) return 0;
+    r_queue_send(link, m, (uint32_t)n, *r_cp_ctrl, NULL, NULL);
+    return 1;
+}
+
+static void rgd_car_identify(const uint8_t *m, uint32_t n) {
+    size_t pl = 0;
+    const uint8_t *p = iap_param(m, n, ID_RGD_COMPONENT, &pl);
+    unsigned cid = 0;
+    if (p && pl > RGD_COMP_CAP) p = NULL;
+    if (p && pl >= 10 && be16(p + 4) == 6 && be16(p + 6) == 0) cid = be16(p + 8);
+    pthread_mutex_lock(&g_rgd_lock);
+    g_rgd.comp_len = p ? pl : 0;
+    if (p) memcpy(g_rgd.comp, p, pl);
+    g_rgd.start_len = 0;
+    pthread_mutex_unlock(&g_rgd_lock);
+    if (p) dlog("rgd car component=0x%04x len=%u", cid, (unsigned)pl);
+    else dlog("rgd car Identify has no route guidance component");
+}
+
+/* Car start/stop: cached for the next phone link, sent to a phone that
+ * accepted the component. */
+static void rgd_car_route(unsigned id, const uint8_t *m, uint32_t n) {
+    int send;
+    pthread_mutex_lock(&g_rgd_lock);
+    g_rgd.start_len = 0;
+    if (id == RGD_START && n <= RGD_START_CAP) { memcpy(g_rgd.start, m, n); g_rgd.start_len = n; }
+    send = g_rgd.phone_ok && !g_rgd.off;
+    pthread_mutex_unlock(&g_rgd_lock);
+    send = send && rgd_send_phone(m, n);
+    dlog("rgd car 0x%04x %s", id, send ? "to phone" : "kept for the phone");
+}
+
+static void rgd_replay_start(void) {
+    uint8_t m[RGD_START_CAP];
+    size_t n;
+    pthread_mutex_lock(&g_rgd_lock);
+    n = g_rgd.phone_ok && !g_rgd.off ? g_rgd.start_len : 0;
+    memcpy(m, g_rgd.start, n);
+    pthread_mutex_unlock(&g_rgd_lock);
+    if (n && rgd_send_phone(m, n)) dlog("rgd car 0x%04x replayed to the new phone link", RGD_START);
+}
+
+static void rgd_to_car(const uint8_t *m, uint32_t n, unsigned id) {
+    unsigned bit = 1u << (id - RGD_START);
+    r_to_car(m, n, 0);
+    ++g_rgd.to_car;
+    if (!(g_rgd.logged & bit) || g_rgd.to_car % RGD_LOG_EVERY == 0) {
+        g_rgd.logged |= bit;
+        dlog("rgd phone 0x%04x len=%u to car (total %u)", id, (unsigned)n, g_rgd.to_car);
+    }
+}
+
+/* Phone updates, reassembled like the stock handler does: a packet that starts
+ * with 0x4040 opens a message, the rest of it follows on the same session. */
+static void rgd_phone_update(const uint8_t *d, uint32_t n, uint8_t session) {
+    uint32_t take;
+    if (n >= 6 && d[0] == 0x40 && d[1] == 0x40) {
+        unsigned want = be16(d + 2), id = be16(d + 4);
+        g_rgd.rx_want = 0;
+        if ((id != RGD_UPDATE && id != RGD_MANEUVER && id != RGD_LANE) || want < 6) return;
+        if (n >= want) { rgd_to_car(d, want, id); return; }
+        memcpy(g_rgd.rx, d, n);
+        g_rgd.rx_have = n;
+        g_rgd.rx_want = want;
+        g_rgd.rx_session = session;
+        return;
+    }
+    if (!g_rgd.rx_want || session != g_rgd.rx_session) return;
+    take = g_rgd.rx_want - g_rgd.rx_have;
+    if (take > n) take = n;
+    memcpy(g_rgd.rx + g_rgd.rx_have, d, take);
+    g_rgd.rx_have += take;
+    if (g_rgd.rx_have == g_rgd.rx_want) {
+        g_rgd.rx_want = 0;
+        rgd_to_car(g_rgd.rx, g_rgd.rx_have, be16(g_rgd.rx + 4));
+    }
+}
+
+static int rgd_car_ready(void *link, uint8_t *data, uint32_t len, uint8_t session) {
+    unsigned id = iap_msg_id(data, len);
+    if (id == IAP_ID_INFO) rgd_car_identify(data, len);
+    else if (id == RGD_START || id == RGD_STOP) rgd_car_route(id, data, len);
+    return r_car_ready(link, data, len, session);
+}
+
+static int rgd_phone_ready(void *link, uint8_t *data, uint32_t len, uint8_t session) {
+    unsigned id = iap_msg_id(data, len);
+    void *before = r_cp_link ? *r_cp_link : NULL;
+    int rc;
+    if (id == IAP_ID_START) {
+        pthread_mutex_lock(&g_rgd_lock);
+        g_rgd.phone_ok = 0;
+        g_rgd.logged = 0;
+        pthread_mutex_unlock(&g_rgd_lock);
+    } else if (id == IAP_ID_REJECTED) {
+        int was;
+        pthread_mutex_lock(&g_rgd_lock);
+        was = g_rgd.phone_ok;
+        if (was) g_rgd.off = 1;
+        g_rgd.phone_ok = 0;
+        pthread_mutex_unlock(&g_rgd_lock);
+        dlog("rgd phone rejected the Identify%s", was ? "; bridge off until restart" : "");
+    }
+    rgd_phone_update(data, len, session);
+    t_rgd_phone = 1;
+    rc = r_phone_ready(link, data, len, session);
+    t_rgd_phone = 0;
+    if (!before && r_cp_link && *r_cp_link) rgd_replay_start();
+    return rc;
+}
+
+static void rgd_bind(void) {
+    *(void **)&r_rl_create = dlsym_plain(RTLD_NEXT, "iAP2LinkRunLoopCreate");
+    *(void **)&r_queue_send = dlsym_plain(RTLD_NEXT, "iAP2LinkQueueSendData");
+    *(void **)&r_car_ready = dlsym_plain(RTLD_DEFAULT, "iap2_dev_recv_data");
+    *(void **)&r_phone_ready = dlsym_plain(RTLD_DEFAULT,
+        "_ZN18CarPlayIAP2Session19iAP2LinkDataReadyCBEP11iAP2Link_stPhjh");
+    *(void **)&r_to_car = dlsym_plain(RTLD_DEFAULT, "iap2_send_message_to_proxy_usb");
+    r_cp_link = dlsym_plain(RTLD_DEFAULT, "gOverCarplayLink");
+    r_cp_ctrl = dlsym_plain(RTLD_DEFAULT, "gOverCarPlayCtrlSession");
+    g_rgd.off = !CLUSTER_RGD || disabled() || flag(RGD_OFF_FILE) || !r_queue_send ||
+                !r_car_ready || !r_phone_ready || !r_to_car || !r_cp_link || !r_cp_ctrl;
+    dlog("rgd bridge %s create=%d send=%d car=%d phone=%d", g_rgd.off ? "off" : "on",
+         r_rl_create != 0, r_queue_send != 0, r_car_ready != 0, r_phone_ready != 0);
+}
+
+void *iAP2LinkRunLoopCreate(int type, void *ctx, void *syn, void *send, void *send2,
+                            iap_ready_fn ready, void *connected, void *detect,
+                            int validate, int max_packets, void *buf) {
+    pthread_once(&g_rgd_once, rgd_bind);
+    if (!r_rl_create) return NULL;
+    if (!g_rgd.off && ready && ready == r_car_ready) ready = rgd_car_ready;
+    else if (!g_rgd.off && ready && ready == r_phone_ready) ready = rgd_phone_ready;
+    return r_rl_create(type, ctx, syn, send, send2, ready, connected, detect, validate, max_packets, buf);
+}
+
+int iAP2LinkQueueSendData(void *link, const uint8_t *data, uint32_t len, uint8_t session,
+                          void *ctx, void *done) {
+    static uint8_t out[ID_OUT_CAP];   /* phone run loop thread only (t_rgd_phone) */
+    pthread_once(&g_rgd_once, rgd_bind);
+    if (!r_queue_send) return 0;
+    if (t_rgd_phone && iap_msg_id(data, len) == IAP_ID_INFO) {
+        size_t n = 0, comp_len;
+        pthread_mutex_lock(&g_rgd_lock);
+        comp_len = g_rgd.comp_len;
+        if (!g_rgd.off) n = rgd_patch_identify(data, len, g_rgd.comp, comp_len, out, sizeof out);
+        g_rgd.phone_ok = n != 0;
+        pthread_mutex_unlock(&g_rgd_lock);
+        if (n) {
+            dlog("rgd phone Identify +route guidance %u -> %u bytes", (unsigned)len, (unsigned)n);
+            return r_queue_send(link, out, (uint32_t)n, session, ctx, done);
+        }
+        dlog("rgd phone Identify unchanged (%s)", g_rgd.off ? "bridge off" :
+             comp_len ? "unexpected layout" : "no car component");
+    }
+    return r_queue_send(link, data, len, session, ctx, done);
+}
+
 __attribute__((constructor)) static void init(void) {
     dlog("LOADED pid=%d step=%d advert=%d", (int)getpid(), CLUSTER_STEP, CLUSTER_ADVERT);
 }
