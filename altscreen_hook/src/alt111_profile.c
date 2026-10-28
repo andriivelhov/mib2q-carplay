@@ -3,6 +3,27 @@
 
 const char *alt111_initial_url(void) { return "maps:/car/instrumentcluster"; }
 
+int alt111_url_eta_off(const char *url, char *out, size_t cap)
+{
+    static const char key[] = "showETA=";
+    const char *p, *value, *rest;
+    size_t at;
+    if (!url || !out || !(p = strchr(url, '?'))) return 0;
+    for (; p; p = strchr(p + 1, '&')) {
+        value = p + 1 + (sizeof(key) - 1);
+        if (strncmp(p + 1, key, sizeof(key) - 1) != 0 || strncmp(value, "yes", 3) != 0 ||
+            (value[3] != '&' && value[3] != '\0')) continue;
+        at = (size_t)(value - url);
+        rest = value + 3;
+        if (at + 2 + strlen(rest) >= cap) return 0;
+        memcpy(out, url, at);
+        memcpy(out + at, "no", 2);
+        memcpy(out + at + 2, rest, strlen(rest) + 1);
+        return 1;
+    }
+    return 0;
+}
+
 void alt111_profile_mu1440(struct alt111_profile *p, unsigned hid_ready)
 {
     memset(p, 0, sizeof(*p));

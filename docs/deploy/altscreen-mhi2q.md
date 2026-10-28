@@ -193,8 +193,11 @@ with a session up (`command_ready=1` in `/tmp/mibr-alt111-gen2.status`) re-sends
 depends on the cockpit layout: a switch between the wide view and a small map sends `showUI` with the
 new URL first, then `updateViewArea`. When an app starts
 guidance and iOS hands it the cluster, iOS sends `suggestUI`; 1 s later the hook answers with
-`showUI` (then `updateViewArea` and `forceKeyFrame`) so that app gets the current URL too (issue #35:
-without it Waze drew no ETA after a reconnect). Java still sends
+`showUI` (then `updateViewArea` and `forceKeyFrame`) so that app gets the current URL too. A `showUI`
+that repeats the URL the phone already has does not reach that app, so with ETA ON the answer starts
+with one `showUI` carrying `showETA=no` and then sends the saved URL (issue #35: without it Waze drew
+no ETA after a reconnect or after another app had guided, until the ETA switch went OFF and ON).
+Java still sends
 `CMD_ALT_RGI 0x0116` on route-guidance edges; `altscreen111_set_rgi` only logs it.
 
 The turn-card URL carries no `maneuverLayout`: 1.2's `rightAligned` pinned the app's card to the SafeArea's

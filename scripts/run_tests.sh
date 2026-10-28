@@ -108,7 +108,8 @@ cc -std=c99 -O2 -Wall -Wextra -Werror -pedantic -Ialtscreen_render \
 
 printf '%-32s ' alt111_control_test
 cc -std=c99 -O2 -Wall -Wextra -Werror -pedantic -Ialtscreen_hook/include \
-    tests/alt111_control_test.c altscreen_hook/src/alt111_control.c -o "$OUT/alt111_control"
+    tests/alt111_control_test.c altscreen_hook/src/alt111_control.c \
+    altscreen_hook/src/alt111_profile.c -o "$OUT/alt111_control"
 "$OUT/alt111_control"
 
 printf '%-32s ' hw301_bridge_tests

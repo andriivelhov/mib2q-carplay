@@ -520,9 +520,11 @@ static uint64_t g2_d2_coalesced;
 /*
  * suggestUI -> showUI. iOS sends suggestUI (empty url list) when a navigation
  * app starts guidance and takes the cluster over. Unanswered, that app never got
- * our URL query: Waze drew no ETA after a reconnect until a GEM switch re-sent
- * showUI (issue #35). The delay lets the hand-over land first and folds a
- * suggestUI burst into one showUI.
+ * our URL query: Waze drew no ETA after a reconnect, or after another app had
+ * guided, until the GEM switch went OFF and ON (issue #35). Re-sending the same
+ * URL, even after a stopUI, did not help in the car; a change did. So with
+ * showETA=yes the answer is showUI with showETA=no, then the saved URL. The delay
+ * lets the hand-over land first and folds a suggestUI burst into one answer.
  */
 #define G2_RESHOW_DELAY_MS 1000u
 static uint64_t g2_reshow_due_ms;
@@ -3075,13 +3077,20 @@ CFDictionaryRef AirPlayCopyServerInfo(AirPlayReceiverSessionRef session, CFArray
     return info;
 }
 
-static CFMutableDictionaryRef command_showui(void)
+/* eta_flip: the saved URL with showETA=no, sent just before the saved one (issue #35). */
+static CFMutableDictionaryRef command_showui(unsigned eta_flip)
 {
-    char active_url[384];
+    char active_url[384], eta_off[384];
+    const char *url;
     CFMutableDictionaryRef req=dict_new(), params=dict_new();
     if(!req||!params){if(req)p_CFRelease(req);if(params)p_CFRelease(params);return NULL;}
     active_alt_url_copy(active_url,sizeof(active_url));
-    set_str(req,"type","showUI"); set_str(params,"uuid",g_alt_uuid); set_str(params,"url",active_url);
+    url=active_url;
+    if(eta_flip && alt111_url_eta_off(active_url,eta_off,sizeof(eta_off))){
+        url=eta_off;
+        logf_u2("gen2 showUI ETA flip url=%s (the saved URL follows)",url);
+    }
+    set_str(req,"type","showUI"); set_str(params,"uuid",g_alt_uuid); set_str(params,"url",url);
     { CFStringRef k=s_cf("params"); p_CFDictionarySetValue(req,k,params); p_CFRelease(k); }
     p_CFRelease(params); return req;
 }
@@ -3210,7 +3219,8 @@ int altscreen111_view_area(int view)
     if(g2_control_session){
         active=1;
         rc=alt111_control_intent(&g2_control,g2_control.desired,(unsigned)view);
-        if(rc==ALT111_OK && reshow) alt111_control_reshow(&g2_control,g2_control_session);
+        /* The URL itself changed, so a plain SHOW reaches the app: no flip. */
+        if(rc==ALT111_OK && reshow) alt111_control_reshow(&g2_control,g2_control_session,0);
     }
     pthread_cond_broadcast(&g2_core_cv);
     pthread_mutex_unlock(&g2_core_lock);
@@ -3258,7 +3268,7 @@ static CFMutableDictionaryRef gen2_command_dictionary(const struct alt111_comman
 {
     if (!cmd) return NULL;
     switch (cmd->type) {
-    case ALT111_CMD_SHOW: return command_showui();
+    case ALT111_CMD_SHOW: return command_showui(cmd->flip);
     case ALT111_CMD_STOP: return command_stopui();
     case ALT111_CMD_VIEW: return command_update_view(cmd->view);
     case ALT111_CMD_KEYFRAME: return command_force_keyframe();
@@ -3684,7 +3694,7 @@ static void gen2_process_diag_markers(void)
         unlink(g2_diag_show_marker);
         active_alt_url_copy(active_url,sizeof(active_url));
         logf_u2("gen2 DIAG marker show-only url=%s",active_url);
-        gen2_dispatch_diag_command("showUI",command_showui());
+        gen2_dispatch_diag_command("showUI",command_showui(0));
     }
     if(access(g2_diag_stop_marker,F_OK)==0){
         unlink(g2_diag_stop_marker);
@@ -3707,17 +3717,22 @@ static void gen2_process_diag_markers(void)
 static void gen2_process_reshow(void)
 {
     int rc;
+    unsigned due, flip;
+    char url[384], eta_off[384];
     uint64_t now = monotonic_ms();
     pthread_mutex_lock(&g2_core_lock);
-    if(!g2_reshow_due_ms || now < g2_reshow_due_ms){
-        pthread_mutex_unlock(&g2_core_lock);
-        return;
-    }
-    g2_reshow_due_ms = 0;
-    rc = g2_control_session ? alt111_control_reshow(&g2_control,g2_control_session) : ALT111_STALE;
+    due = g2_reshow_due_ms && now >= g2_reshow_due_ms;
+    if(due) g2_reshow_due_ms = 0;
+    pthread_mutex_unlock(&g2_core_lock);
+    if(!due) return;
+    /* Flip only an ETA ON URL: that is the setting issue #35 lost. */
+    active_alt_url_copy(url,sizeof(url));
+    flip = (unsigned)alt111_url_eta_off(url,eta_off,sizeof(eta_off));
+    pthread_mutex_lock(&g2_core_lock);
+    rc = g2_control_session ? alt111_control_reshow(&g2_control,g2_control_session,flip) : ALT111_STALE;
     pthread_cond_broadcast(&g2_core_cv);
     pthread_mutex_unlock(&g2_core_lock);
-    logf_u2("gen2 suggestUI -> showUI reshow rc=%d",rc);
+    logf_u2("gen2 suggestUI -> showUI reshow rc=%d eta_flip=%u url=%s",rc,flip,url);
 }
 
 static void *gen2_control_worker(void *arg)
@@ -4147,7 +4162,8 @@ static OSStatus mibr_platform_control(AirPlayReceiverSessionRef session, uint32_
      * stock-authoritative.
      *
      * The suggested URL list (empty in every log) is not shown; instead the
-     * worker answers with showUI of our own URL after G2_RESHOW_DELAY_MS.
+     * worker answers with showUI of our own URL after G2_RESHOW_DELAY_MS
+     * (with ETA ON, preceded by a showUI with showETA=no).
      */
     if(g_enabled && c && strcmp(c,"suggestUI")==0){
         pthread_mutex_lock(&g2_core_lock);

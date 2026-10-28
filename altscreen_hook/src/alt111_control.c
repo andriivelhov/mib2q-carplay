@@ -26,7 +26,7 @@ uint64_t alt111_control_begin(struct alt111_control *c)
 {
     cancel(c);
     ++c->session;
-    c->active = 1; c->shown_ack = c->may_be_visible = c->reacquiring = 0;
+    c->active = 1; c->shown_ack = c->may_be_visible = c->reacquiring = c->flip = 0;
     c->acknowledged_view = -1;
     c->keyframe_wanted = c->keyframe_done = 0;
     return c->session;
@@ -36,7 +36,7 @@ int alt111_control_end(struct alt111_control *c, uint64_t session)
 {
     if (!c->active || session != c->session) return ALT111_STALE;
     cancel(c);
-    c->active = c->shown_ack = c->may_be_visible = c->reacquiring = 0;
+    c->active = c->shown_ack = c->may_be_visible = c->reacquiring = c->flip = 0;
     c->acknowledged_view = -1;
     return ALT111_OK;
 }
@@ -50,7 +50,7 @@ int alt111_control_intent(struct alt111_control *c, unsigned visible, unsigned v
     if (c->desired != visible) {
         if (c->pending.type == ALT111_CMD_STOP) c->shown_ack = 0;
         cancel(c);
-        c->reacquiring = 0;
+        c->reacquiring = c->flip = 0;
     } else if (c->exhausted) {
         cancel(c);
     }
@@ -81,15 +81,18 @@ int alt111_control_reacquire(struct alt111_control *c, uint64_t session)
     return ALT111_OK;
 }
 
-int alt111_control_reshow(struct alt111_control *c, uint64_t session)
+int alt111_control_reshow(struct alt111_control *c, uint64_t session, unsigned flip)
 {
     if (!c->active || session != c->session) return ALT111_STALE;
     if (!c->desired) return ALT111_WAIT;
+    /* A pending command completes as usual; SHOW follows it. Like an explicit
+     * reacquire, this new event may clear an exhausted transaction. */
+    if (c->exhausted) cancel(c);
+    /* Even a SHOW still due would repeat the URL; the flipped one goes first.
+     * A burst sets the flag once, so it gives one flipped SHOW. */
+    if (flip) { c->flip = 1; return ALT111_OK; }
     /* A SHOW still due (or in flight) builds its URL when it is sent. */
     if (c->reacquiring || !c->shown_ack) return ALT111_OK;
-    /* A pending VIEW/KEYFRAME completes as usual; SHOW follows it. Like an
-     * explicit reacquire, this new event may clear an exhausted transaction. */
-    if (c->exhausted) cancel(c);
     c->shown_ack = 0;
     return ALT111_OK;
 }
@@ -102,6 +105,9 @@ int alt111_control_complete(struct alt111_control *c, uint64_t session,
         cmd.request != request) return ALT111_STALE;
     memset(&c->pending, 0, sizeof(c->pending));
     if (now_ms >= c->deadline_ms) success = 0;
+    /* The flipped URL only makes the next SHOW a change. Failed or not (the
+     * phone may have applied it), the real SHOW follows; no second flip. */
+    if (cmd.flip) c->flip = c->shown_ack = 0;
     if (!success) {
         ++c->failures;
         c->exhausted = c->failures >= ALT111_ATTEMPTS;
@@ -111,7 +117,9 @@ int alt111_control_complete(struct alt111_control *c, uint64_t session,
     c->failures = c->exhausted = 0; c->retry_at_ms = 0;
     switch (cmd.type) {
     case ALT111_CMD_SHOW:
-        c->shown_ack = c->may_be_visible = 1;
+        c->may_be_visible = 1;
+        if (cmd.flip) break;
+        c->shown_ack = 1;
         c->reacquiring = 0;
         /*
          * A single-view profile already declares initialViewArea=0 in /info.
@@ -149,7 +157,7 @@ int alt111_control_next(struct alt111_control *c, uint64_t now_ms,
     if (!c->desired) {
         if (c->may_be_visible) type = ALT111_CMD_STOP;
     } else if (c->reacquiring == 1) type = ALT111_CMD_STOP;
-    else if (!c->shown_ack) type = ALT111_CMD_SHOW;
+    else if (!c->shown_ack || c->flip) type = ALT111_CMD_SHOW;
     else if (c->acknowledged_view != (int)c->desired_view) type = ALT111_CMD_VIEW;
     else if (c->keyframe_done != c->keyframe_wanted) type = ALT111_CMD_KEYFRAME;
     if (type == ALT111_CMD_NONE) return ALT111_WAIT;
@@ -158,6 +166,7 @@ int alt111_control_next(struct alt111_control *c, uint64_t now_ms,
     c->pending.request = ++c->sequence;
     c->pending.view = c->desired_view;
     c->pending.keyframe_demand = c->keyframe_wanted;
+    c->pending.flip = type == ALT111_CMD_SHOW && c->flip;
     c->deadline_ms = after(now_ms, ALT111_COMMAND_TIMEOUT_MS);
     if (type == ALT111_CMD_SHOW) c->may_be_visible = 1;
     *out = c->pending;

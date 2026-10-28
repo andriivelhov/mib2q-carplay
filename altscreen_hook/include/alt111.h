@@ -37,6 +37,9 @@ struct alt111_profile {
 void alt111_profile_mu1440(struct alt111_profile *p, unsigned hid_ready);
 int alt111_profile_validate(const struct alt111_profile *p);
 const char *alt111_initial_url(void);
+/* url with its exact query item showETA=yes changed to showETA=no: 1 when out
+ * holds that URL, 0 (out untouched) when url has no such item or out is short. */
+int alt111_url_eta_off(const char *url, char *out, size_t cap);
 
 enum alt111_command_type {
     ALT111_CMD_NONE, ALT111_CMD_SHOW, ALT111_CMD_STOP,
@@ -46,12 +49,14 @@ struct alt111_command {
     uint64_t session, request, keyframe_demand;
     enum alt111_command_type type;
     unsigned view;
+    /* SHOW only: the adapter builds a URL that differs from the current one. */
+    unsigned flip;
 };
 struct alt111_control {
     uint64_t session, sequence, deadline_ms, retry_at_ms;
     uint64_t keyframe_wanted, keyframe_done;
     unsigned active, desired, desired_view, view_count;
-    unsigned shown_ack, may_be_visible, reacquiring;
+    unsigned shown_ack, may_be_visible, reacquiring, flip;
     unsigned failures, exhausted;
     int acknowledged_view;
     struct alt111_command pending;
@@ -64,8 +69,11 @@ int alt111_control_keyframe(struct alt111_control *c, uint64_t session);
 /* Explicit operator/validated ownership event only; never video-idle polling. */
 int alt111_control_reacquire(struct alt111_control *c, uint64_t session);
 /* Re-send SHOW (then VIEW and KEYFRAME) without a STOP, so the app iOS hands the
- * cluster to mid-session gets the current URL. No-op while a SHOW is still due. */
-int alt111_control_reshow(struct alt111_control *c, uint64_t session);
+ * cluster to mid-session gets the current URL. No-op while a SHOW is still due.
+ * A showUI that repeats the current URL does not reach that app (issue #35), so
+ * flip (even with a SHOW due) first sends one SHOW with cmd.flip set, then the
+ * SHOW with the real URL. */
+int alt111_control_reshow(struct alt111_control *c, uint64_t session, unsigned flip);
 int alt111_control_next(struct alt111_control *c, uint64_t now_ms,
                        struct alt111_command *out);
 int alt111_control_complete(struct alt111_control *c, uint64_t session,

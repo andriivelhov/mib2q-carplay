@@ -66,14 +66,19 @@ Changes since [1.3.1](CHANGELOG-1.3.1.md).
 
 ## Fixed
 
-- **Cluster map ETA missing after a reconnect until the switch was toggled (issue #35).** The
-  ETA (and the speed limit and compass) settings reached only the app that drew the cluster at
-  connect time. When Waze started guidance later, iOS handed it the cluster with a `suggestUI`,
-  which the hook acknowledged but never answered, so Waze drew no ETA although the switch was ON.
-  The hook now answers `suggestUI` 1 s later with `showUI` and the current URL, followed by
-  `updateViewArea` and `forceKeyFrame`, in the same order as at session start. A burst of
-  `suggestUI` gives one `showUI`. `altscreen111.log`: `policy=RESHOW` and
-  `gen2 suggestUI -> showUI reshow rc=0`. *Car test pending.*
+- **Cluster map ETA missing in Waze until the switch was toggled (issue #35).** With *Cluster
+  map ETA* ON, Waze drew no ETA after a reconnect, or after Google Maps had guided in the same
+  session, until the switch went OFF and ON. When an app starts guidance, iOS hands it the cluster
+  with a `suggestUI`, which the hook acknowledged but never answered. The hook now answers
+  `suggestUI` 1 s later with `showUI`, followed by `updateViewArea` and `forceKeyFrame`, in the
+  same order as at session start. Re-sending the same URL (also after a `stopUI`) was not enough
+  in the car; a changed URL was. So with ETA ON the answer is first one `showUI` with
+  `showETA=no`, then the saved URL once that one completed. The saved URL also follows when the
+  first one fails, because the phone may have applied it anyway. Both go through the same
+  command queue as the other cluster commands, in the running CarPlay session. The saved switch
+  is not changed. A burst of `suggestUI` gives one answer. `altscreen111.log`: `policy=RESHOW`, `gen2 suggestUI -> showUI reshow rc=0 eta_flip=1`
+  and `gen2 showUI ETA flip url=…`. *The same sequence fixed it in the reporter's car; car test of
+  this build pending.*
 
 ## Known issues
 
