@@ -11,7 +11,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <sys/mman.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -211,6 +211,10 @@ typedef void *AirPlayReceiverSessionRef;
  *   mibr-carplay111-nav.showETA        no (default) / yes
  *   mibr-carplay111-nav.showSpeedLimit no (default) / yes / user (iPhone setting)
  *   mibr-carplay111-nav.showCompass    no (default) / yes / user (iPhone setting)
+ *   mibr-carplay111-nav.wideAll        no (default) / yes = on the wide view (ViewArea 0)
+ *                                      turn card, ETA, speed limit and compass all on,
+ *                                      whatever the four switches above say; the small
+ *                                      views keep using them
  * No maneuverLayout by default: rightAligned pinned the card to the SafeArea's right
  * edge and the app moved the puck left of it (issue #20; on the Sport skin the card
  * also went behind the rev counter).  mibr-carplay111-nav.maneuverLayout still picks
@@ -407,6 +411,9 @@ static const char *g_nav_speed_path = "/mnt/app/root/mibr-carplay111-nav.showSpe
 static const char *g_nav_compass_path = "/mnt/app/root/mibr-carplay111-nav.showCompass";
 static const char *g_nav_maneuver_path = "/mnt/app/root/mibr-carplay111-nav.maneuverLayout";
 static const char *g_nav_show_maneuver_path = "/mnt/app/root/mibr-carplay111-nav.showManeuver";
+static const char *g_nav_wide_all_path = "/mnt/app/root/mibr-carplay111-nav.wideAll";
+/* Defined with the ViewAreas below; the URL policy and the back-channel read it. */
+static volatile int g_desired_view;
 /* Present => historic bare URL instead of the guidance-source URLs (rollback). */
 static const char *g_rgi_url_disable_marker = "/mnt/app/root/mibr-carplay111-rgi-url.disabled";
 /*
@@ -419,10 +426,9 @@ static const char *g_rgi_url_disable_marker = "/mnt/app/root/mibr-carplay111-rgi
  * config edit: echo 6200 > /mnt/app/mibr-carplay111.port
  */
 static const char *g_port_override_path = "/mnt/app/mibr-carplay111.port";
-/* Port the HW301 dongle dials. cluster_dual.c reads /mnt/UDISK/cluster_hu.port
- * on the dongle; this file is the head-unit copy of that number. Absent on
- * both sides means 7100. The wired override above is not this port: SETUP
- * does not tell the dongle where the listener went. */
+/* Legacy firmware's fixed video port. Old dongle images read
+ * /mnt/UDISK/cluster_hu.port; absent on both ends means 7100. Native proxies
+ * use the normal SETUP response dataPort and the override above. */
 static const char *g_dongle_port_path = "/mnt/app/cluster_hu.port";
 /*
  * Same idea for the /info advertisement itself. Creating this file makes
@@ -942,6 +948,14 @@ static int rgi_url_policy_applies(void)
     return strcmp(g_alt_url, ALT_URL_DEFAULT) == 0;
 }
 
+/* GEM "all map features on the wide view": wins over the four switches on view 0 only. */
+static int nav_wide_all_active(void)
+{
+    char v[8];
+    nav_tristate_value(g_nav_wide_all_path, v, sizeof(v), "no");
+    return (strcmp(v, "yes") == 0 || strcmp(v, "1") == 0) && g_desired_view == 0;
+}
+
 static void active_alt_url_copy(char *out, size_t cap)
 {
     char surface[24];
@@ -952,10 +966,17 @@ static void active_alt_url_copy(char *out, size_t cap)
     out[0] = '\0';
     if (rgi_url_policy_applies()) {
         char card[8];
-        nav_tristate_value(g_nav_eta_path, eta, sizeof(eta), "no");
-        nav_tristate_value(g_nav_speed_path, speed, sizeof(speed), "no");
-        nav_tristate_value(g_nav_compass_path, compass, sizeof(compass), "no");
-        nav_tristate_value(g_nav_show_maneuver_path, card, sizeof(card), "yes");
+        if (nav_wide_all_active()) {
+            snprintf(eta, sizeof(eta), "%s", "yes");
+            snprintf(speed, sizeof(speed), "%s", "yes");
+            snprintf(compass, sizeof(compass), "%s", "yes");
+            snprintf(card, sizeof(card), "%s", "yes");
+        } else {
+            nav_tristate_value(g_nav_eta_path, eta, sizeof(eta), "no");
+            nav_tristate_value(g_nav_speed_path, speed, sizeof(speed), "no");
+            nav_tristate_value(g_nav_compass_path, compass, sizeof(compass), "no");
+            nav_tristate_value(g_nav_show_maneuver_path, card, sizeof(card), "yes");
+        }
         if (strcmp(card, "no") == 0 || strcmp(card, "0") == 0) {
             snprintf(out, cap, "%s?showETA=%s&maneuverLayout=no&showSpeedLimit=%s&showCompass=%s",
                      ALT_URL_MAP, eta, speed, compass);
@@ -1292,10 +1313,11 @@ static int dongle_listen_port(void)
 /*
  * Senders that must not see the AltScreen advertisement.
  *
- * The wireless CarPlay dongle (model=iPhone9,1 iOS 18D70, a fixed persona for
+ * Legacy wireless firmware (model=iPhone9,1 iOS 18D70, a fixed persona for
  * whatever phone is behind it) is force-suppressed here: advertising the cluster
  * to it makes its CarPlay session drop within seconds, so it is pinned to the
- * single-display path and served the stock /info. Other senders can be suppressed
+ * single-display path and served the stock /info. The native HW301 proxy reports
+ * its actual model and follows the normal two-display path. Other senders can be suppressed
  * via /mnt/app/root/mibr-carplay111-noadvertise.senders, one "model osBuildVersion"
  * per line ("*" = any build).
  */
@@ -1308,7 +1330,6 @@ static int g_alt_bc_last_view = -1;   /* last ViewArea index pushed to the dongl
  * session exists to send forceKeyFrame: the receiver thread sends "KEYF" on
  * the back-channel and the dongle asks the phone. Guarded by g_lock. */
 static int g_alt_bc_keyframe;
-static volatile int g_desired_view;   /* defined below; declared here for the back-channel */
 
 static int sender_listed(const char *model, const char *build)
 {
@@ -1903,11 +1924,25 @@ static void *gen2_output_worker(void *arg)
     return NULL;
 }
 
+static int dongle_send_controls(int fd);
+
 static int read_exact(int fd, void *buf, size_t len)
 {
     uint8_t *p = (uint8_t *)buf;
     while (len) {
-        ssize_t n = recv(fd, p, len, 0);
+        ssize_t n;
+        /* Native stream 111 (phones and updated proxies) needs no polling.
+         * Only legacy firmware has controls on the video socket. */
+        if (g_dongle_alt_cid) {
+            struct pollfd pf;
+            int rc;
+            if (dongle_send_controls(fd) != 0) return -1;
+            pf.fd = fd; pf.events = POLLIN; pf.revents = 0;
+            rc = poll(&pf, 1, 100);
+            if (rc < 0) { if (errno == EINTR) continue; return -1; }
+            if (!rc) continue;
+        }
+        n = recv(fd, p, len, 0);
         if (n == 0) return 0;
         if (n < 0) { if (errno == EINTR) continue; return -1; }
         p += n; len -= (size_t)n;
@@ -2146,14 +2181,51 @@ static void stop_alt_receiver(void)
 static int send_view_msg(int fd, const uint8_t *msg, size_t len)
 {
     size_t off = 0;
+    uint64_t deadline = monotonic_ms() + 200;
     while (off < len) {
-        ssize_t w = send(fd, msg + off, len - off, MSG_NOSIGNAL);
-        if (w > 0) {
-            off += (size_t)w;
-            continue;
-        }
-        if (w < 0 && errno == EINTR) continue;
+        struct pollfd pf;
+        ssize_t w;
+        int rc;
+        uint64_t now = monotonic_ms();
+        if (now >= deadline) { errno = ETIMEDOUT; return -1; }
+        pf.fd = fd; pf.events = POLLOUT; pf.revents = 0;
+        rc = poll(&pf, 1, (int)(deadline - now));
+        if (rc < 0) { if (errno == EINTR) continue; return -1; }
+        if (!rc) { errno = ETIMEDOUT; return -1; }
+        w = send(fd, msg + off, len - off, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         return -1;
+    }
+    return 0;
+}
+
+static int dongle_send_controls(int fd)
+{
+    if (g_dongle_alt_cid) {                 /* dongle receiver: push view changes back to it */
+        int v = g_desired_view;
+        if (v != g_alt_bc_last_view) {
+            uint8_t m[8] = { 'V','I','E','W',
+                             (uint8_t)v, (uint8_t)(v>>8), (uint8_t)(v>>16), (uint8_t)(v>>24) };
+            if (send_view_msg(fd, m, sizeof m) != 0) {
+                logf_u2("dongle back-channel: view send failed: %s", strerror(errno));
+                return -1;
+            }
+            g_alt_bc_last_view = v;
+            logf_u2("dongle back-channel: sent ViewArea %d", v);
+        }
+        pthread_mutex_lock(&g_lock);
+        v = g_alt_bc_keyframe;
+        g_alt_bc_keyframe = 0;
+        pthread_mutex_unlock(&g_lock);
+        if (v) {
+            static const uint8_t k[8] = { 'K','E','Y','F', 0, 0, 0, 0 };
+            if (send_view_msg(fd, k, sizeof k) != 0) {
+                logf_u2("dongle back-channel: key frame request send failed: %s", strerror(errno));
+                return -1;
+            }
+            logf_u2("dongle back-channel: sent key frame request");
+        }
     }
     return 0;
 }
@@ -2172,17 +2244,14 @@ static void *alt_receiver_thread(void *arg)
     {
         unsigned waited = 0;
         for (;;) {
-            fd_set rd; struct timeval tv; int n, current;
+            struct pollfd pf; int n, current;
             pthread_mutex_lock(&g_lock); current = g_alt_listen; pthread_mutex_unlock(&g_lock);
             if (current != listen_fd) {
                 logf_u2("MHI2Q stream111: listener closed before accept");
                 return NULL;
             }
-            /* QNX FD_SET indexes fds_bits with no range check (FD_SETSIZE is 256). */
-            if (listen_fd < 0 || listen_fd >= FD_SETSIZE) break;
-            FD_ZERO(&rd); FD_SET(listen_fd, &rd);
-            tv.tv_sec = 1; tv.tv_usec = 0;
-            n = select(listen_fd + 1, &rd, NULL, NULL, &tv);
+            pf.fd = listen_fd; pf.events = POLLIN; pf.revents = 0;
+            n = poll(&pf, 1, 1000);
             if (n > 0) {
                 pthread_mutex_lock(&g_lock); current = g_alt_listen; pthread_mutex_unlock(&g_lock);
                 if (current != listen_fd) {
@@ -2192,7 +2261,7 @@ static void *alt_receiver_thread(void *arg)
                 break;
             }
             if (n < 0 && errno != EINTR) {
-                logf_u2("MHI2Q stream111: select failed: %s", strerror(errno));
+                logf_u2("MHI2Q stream111: poll failed: %s", strerror(errno));
                 return NULL;
             }
             if (n == 0 && (++waited == 10u || waited % 60u == 0u))
@@ -2219,31 +2288,6 @@ static void *alt_receiver_thread(void *arg)
         AirPlayScreenHeaderCompat h;
         uint8_t *body = NULL;
         int rr;
-        if (g_dongle_alt_cid) {                 /* dongle receiver: push view changes back to it */
-            int v = g_desired_view;
-            if (v != g_alt_bc_last_view) {
-                uint8_t m[8] = { 'V','I','E','W',
-                                 (uint8_t)v, (uint8_t)(v>>8), (uint8_t)(v>>16), (uint8_t)(v>>24) };
-                if (send_view_msg(c, m, sizeof m) != 0) {
-                    logf_u2("dongle back-channel: view send failed: %s", strerror(errno));
-                    break;
-                }
-                g_alt_bc_last_view = v;
-                logf_u2("dongle back-channel: sent ViewArea %d", v);
-            }
-            pthread_mutex_lock(&g_lock);
-            v = g_alt_bc_keyframe;
-            g_alt_bc_keyframe = 0;
-            pthread_mutex_unlock(&g_lock);
-            if (v) {
-                static const uint8_t k[8] = { 'K','E','Y','F', 0, 0, 0, 0 };
-                if (send_view_msg(c, k, sizeof k) != 0) {
-                    logf_u2("dongle back-channel: key frame request send failed: %s", strerror(errno));
-                    break;
-                }
-                logf_u2("dongle back-channel: sent key frame request");
-            }
-        }
         rr = read_exact(c, &h, sizeof(h));
         if (rr <= 0) break;
         if (h.bodySize > MAX_SCREEN_BODY) { logf_u2("reject bodySize=%u", h.bodySize); break; }
@@ -2425,6 +2469,7 @@ static int start_alt_receiver(uint64_t connection_id, int pinned_port)
         return -1;
     }
     g_alt_port = actual;
+    g_dongle_alt_cid = pinned_port > 0 ? connection_id : 0;
     if (pthread_create(&g_alt_thread, NULL, alt_receiver_thread, (void *)(intptr_t)g_alt_listen) != 0) {
         close(g_alt_listen);
         g_alt_listen=-1;
@@ -3148,22 +3193,30 @@ static void gen2_dispatch_diag_command(const char *label, CFMutableDictionaryRef
  */
 int altscreen111_view_area(int view)
 {
-    int rc = 0, active = 0;
+    int rc = 0, active = 0, reshow;
+    char before[384], after[384];
     if(view<0 || view>=g_view_count){
         logf_u2("gen2 view area %d ignored (%d advertised)",view,g_view_count);
         return -1;
     }
     if(g_desired_view==view) return 0;
+    /* The wideAll switch makes the URL depend on the view: showUI first, the
+     * control core then re-applies updateViewArea after the SHOW ack. */
+    active_alt_url_copy(before,sizeof(before));
     g_desired_view=view;
+    active_alt_url_copy(after,sizeof(after));
+    reshow=strcmp(before,after)!=0;
     pthread_mutex_lock(&g2_core_lock);
     if(g2_control_session){
         active=1;
         rc=alt111_control_intent(&g2_control,g2_control.desired,(unsigned)view);
+        if(rc==ALT111_OK && reshow) alt111_control_reshow(&g2_control,g2_control_session);
     }
     pthread_cond_broadcast(&g2_core_cv);
     pthread_mutex_unlock(&g2_core_lock);
-    logf_u2("gen2 view area -> %d (%s) %s rc=%d",view,view_area_name(view),
-            active?"updateViewArea queued":"for the next session",rc);
+    logf_u2("gen2 view area -> %d (%s) %s%s rc=%d",view,view_area_name(view),
+            active?"updateViewArea queued":"for the next session",
+            active&&reshow?", showUI first (URL changed)":"",rc);
     return rc;
 }
 
@@ -4181,18 +4234,15 @@ static OSStatus mibr_session_setup(AirPlayReceiverSessionRef s, CFDictionaryRef 
 
     hasAlt=g_enabled && contains_stream111(request,&altDesc,&other);
     if(!hasAlt){
-        /* The wireless dongle never asks for 111 (advertisement guard stays ON,
-         * so CPAAProxyEx stays a single-screen bridge). Other dongles seal the
-         * screen with the AES key SetupProxyScreenSecurityInfo derives for
-         * stream 110's connection id. Open the listener on that same id and
-         * leave the SETUP response stock: do not append a 111 entry. */
+        /* Legacy listed senders do not negotiate 111. Preserve their fixed-port
+         * listener and stream-110-derived AES context. Updated proxies request
+         * 111 explicitly and use the normal path below. */
         if(g_sender_noadvertise){
             uint64_t main_cid = stream_cid_of_type(request, 110);
             if(main_cid && !(g_alt_thread_started && g_dongle_alt_cid == main_cid)){
                 int pinned = dongle_listen_port();
                 int dport = pinned > 0 ? start_alt_receiver(main_cid, pinned) : -1;
                 if(dport > 0){
-                    g_dongle_alt_cid = main_cid;
                     logf_u2("dongle sender: stream111 listener cid=%llu port=%d aes=1 (110 key, response unchanged)",
                             (unsigned long long)main_cid, dport);
                 }else{

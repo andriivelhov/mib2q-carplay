@@ -6,7 +6,7 @@ notes were removed in the cleanup; read them in git history (`git log -- dongle/
 Addresses are stock **v1.29** (`CPAAProxyEx` build `20260122129`, link base 0x10000)
 unless stated otherwise.
 
-## Result
+## Released legacy result
 
 Shipped in mib2q-carplay **1.3** (needs the 1.3 head-unit hook). Car-verified with v1154:
 normal CarPlay on the MMI (stream 110, stock path) **and** a dedicated iOS cluster view
@@ -26,6 +26,182 @@ iPhone ==Wi-Fi AirPlay==> HW301 (receiver: libAirPlay) ==USB CarPlay==> MHI2Q
   111 --> cluster_dual.c: listen, ChaCha open --> AES-CTR seal, TCP --> :7100 altscreen hook
                                    <------------- "VIEW"/"KEYF"+u32 back-channel (layout switch, key frame)
 ```
+
+## Current source: v1172 native proxy candidate
+
+The source now replaces CPAAProxyEx's single-screen boundary on the dongle.
+The unpublished v1168 private-protocol experiment is superseded. No special
+`hw301Cluster` metadata, hello/rekey exchange, fixed cluster port or video-socket
+control protocol is used by the native candidate. The archived v1167 release
+and its historical behavior are described separately below.
+
+### Recovered proxy boundaries
+
+The v129 executable has one screen socket, one screen connection ID and one
+screen cipher context. Appending a second display/stream to its internal arrays
+is insufficient. The previous `CFArrayEnsureCreatedAndAppend` interposer also
+had a wrong return ABI (`void` instead of OSStatus); it has been removed entirely.
+This is a concrete defect, not proof of the original crash's precise cause: no
+crash backtrace is available. The replacement keeps all type-111 state outside
+those stock single-screen objects.
+
+`work/ghidra/DumpNativeProxy.java` reproduces the focused decompilation. Relevant
+stock v129 functions and observations:
+
+| Boundary | Evidence / replacement |
+| --- | --- |
+| Car `/info`, `FUN_00038d00` | Parses main display only, then copies the entire display array to proxy info +0xc8. Interpose `CFBinaryPlistV0CreateWithData`, retain the real type-111 descriptor, return a copy without 111 to stock. |
+| Phone `/info`, delegate `FUN_0005a068` | Stock reads that proxy array. `AirPlayCopyServerInfo` appends the retained car descriptor and negotiates altScreen/viewAreas. |
+| Outgoing HTTP plist, `CreateHTTPRequestMsgWithPList` 0x5cefc, size 0x190 | `CFBinaryPlistV0Create` returns an allocated byte buffer, not CFData. Restrict interception to this function's calls; add 111 to the initial native screen SETUP dictionary rather than intercepting array appends. |
+| Screen SETUP, `FUN_0005b5b4` | Stock emits type 110 with connection ID, main UUID and maxFPS. Add a separate type-111 entry with a fresh random ID, the car UUID and car maxFPS. |
+| SETUP completion, `FUN_0005c7ec` | Capture type-111 `dataPort`, then remove that entry before the stock completion sees it. Get the actual peer via `HTTPClientGetPeerAddress(gAirPlayClient, ...)`, preserving IPv6 scope. |
+| `SetupProxyScreenSecurityInfo` 0x5b7c4, size 0x2b8 | AES branch hashes `gSessionAesKey` (GOT 0x17e1a8 -> 0x17ea14), not `gMasterAesKey`. Verify its main-screen derivation against the observed AES initialization, then derive 111 with its own connection ID. |
+| Car command handler `_ProcessProxyRequestCommand` 0x36b38 | Unknown commands are forwarded to an existing phone session. Earlier notes claiming they were always dropped were incomplete. Capture cluster commands before this handler so they also survive a temporarily absent phone. |
+| Phone control delegate `FUN_0005854c` | Generic commands are wrapped as `{type, params}` and forwarded with `AirplayClientSendCmdCmd`; this includes suggestUI. No new private reverse channel is needed. |
+
+The build pins CPAAProxyEx, libAirPlay and libCoreUtils to the inspected stock
+v129 hashes using `work/tools/check_native_abi.py`. The phone pairing-session
+pointer at session +0x3ec remains a private v129 ABI dependency.
+
+### Native negotiation and encryption
+
+The dongle identifies itself as `model=HW301` in its session SETUP and keeps the
+stock `osBuildVersion=18D70`, so the car still sees a real iOS build string. The
+head unit's legacy guard needs both `iPhone9,1` and `18D70`, so the new model
+alone takes the normal path; a `noadvertise.senders` line like `iPhone9,1 *`
+cannot catch it either. The existing head-unit path therefore advertises its normal
+second display, exactly as for a supported sender. No HW301 identity branch or
+private descriptor was added to the head unit. The suppression/listener path for
+unmodified legacy `iPhone9,1/18D70` firmware and custom-listed legacy senders is
+preserved.
+
+The phone receives the car's dimensions, physical size, UUID, FPS, view areas,
+safe areas, initial URL, suggested URLs and unknown descriptor fields intact.
+An absent or invalid second display disables its advertisement; there is no
+local geometry fallback. View areas are optional. `viewareas.single` supplies
+one view and continues to work; disabling view areas also leaves the normal
+second display available. Geometry changes take effect after a fresh /info and
+phone session.
+
+Car SETUP includes independent 110 and 111 connection IDs. Only the car's
+returned port is used. Phone-facing SETUP/TEARDOWN also filter 111 before calling
+stock; a 111-only teardown never becomes an empty, whole-session stock teardown.
+The shim owns the additional phone listener and car socket.
+
+For a mixed phone SETUP, a missing car descriptor/connection ID or a failed
+cluster key derivation, listener bind, worker creation or response allocation
+leaves stock's result intact. The response omits 111 while preserving the main
+and audio streams. A failed 111-only SETUP returns an error. An invalid car
+111 data port or peer address clears the pending ID and key material so the
+next main-screen SETUP can negotiate 111 again with a fresh ID.
+
+Phone video is authenticated with the stock ChaCha20-Poly1305 primitives, using
+the header as AAD and per-connection nonces. Key derivation must succeed before
+the phone receives a successful SETUP response. Car video uses normal
+`AirPlay_DeriveAESKeySHA512ForScreen(sessionKey, 16, cid111, key, iv)` and an
+independent continuous AES-CTR context. Config packets stay clear. Failed phone
+authentication is never relayed; AES errors close the socket without emitting
+plaintext. Dropped unsent frames do not advance CTR. USB AES-CTR does not provide
+per-frame authentication. The v129 USB AES path is supported; a future paired
+HomeKit car transport is rejected for 111 until its sender cipher is implemented.
+
+The car socket and cipher survive phone-only stream/session teardown and
+main-display-only teardown/re-setup. An existing 111 stream is not added again
+to later main SETUPs or retired by their new main-screen keys. Stock's full
+car teardown (`_TeardownProxyClient`, 0x38220) calls `HTTPClientInvalidate` before
+clearing `gAirPlayClient`; that boundary retires stream 111 and its keys. A failed
+relay can be replaced by a fresh 111 SETUP when stock next sets up the main display. A new car socket
+requires fresh native SETUP and a new connection ID; a failed accepted socket is
+not reopened with its old CTR key/IV.
+
+### Native controls and retry behavior
+
+Car showUI/stopUI, updateViewArea and forceKeyFrame use the standard `/command`
+connection. The dongle retains their complete parameter dictionaries (including
+UUID, adjacency, animation duration and future fields), with separate versions
+and phone-generation checks. showUI completion must succeed before view replay.
+Failures retry at most once per second, including asynchronous completion errors.
+Completion tickets remain owned by their callbacks across teardown. If stock
+drops a completion entirely, its small ticket remains allocated; it cannot be
+freed at teardown without risking a late callback using freed memory. This is
+limited to the in-flight slots per abandoned generation, not across unlimited
+reconnects.
+There is no synthetic view payload or URL policy on the dongle. The latest car
+intent is replayed after a phone reconnect and cleared on car teardown. Phone
+suggestUI uses the existing generic stock delegate back to the car.
+
+The head-unit transport uses `poll()` for the legacy control send/listener path,
+sets `ETIMEDOUT` on a send timeout, and leaves native phone/proxy reads blocking.
+Legacy controls are serviced while video is idle. Descriptor numbers above the
+QNX `FD_SETSIZE` limit no longer suppress those reads or listener polling.
+
+### Validation and build
+
+```bash
+SANITIZE=-fsanitize=address,undefined sh scripts/test_hw301.sh
+bash scripts/build_altscreen_hook.sh
+bash dongle/hw301/work/tools/build_dual.sh release
+```
+
+Host tests exercise the production interposers with owned CF graphs and crypto
+primitive doubles: normal /info filtering/forwarding, fresh native IDs, returned
+ports/IPv6 scope, key-derivation inputs, filtering in both directions, full and
+stream-only phone teardown, command failures/replay/stale completions, failed
+crypto and high descriptor numbers. Fault injection also covers mixed versus
+111-only SETUP failures (metadata, ID, derivation, both bind attempts, worker and
+response allocation), unchanged stock errors, invalid car ports/peers, and a
+fresh successful negotiation after each bad reply. Tests require local listener binding.
+Target ARM/QNX builds and import checks verify linkage, not live interoperability.
+No build or test flashes hardware. The first car test (below) covered the main
+path. Phone Wi-Fi reconnect, unplug/replug, native suggestUI/menu/layout behavior
+and a cold start with the dongle already plugged in are still to be tested in the
+car before this candidate can be called a release.
+
+Validation recorded on 2026-10-27:
+
+- The review regressions passed with AddressSanitizer and UBSan on macOS:
+  optional-cluster failure isolation, invalid reply recovery, independent stream
+  lifetimes and real local listener binding. The GCC tests also passed on Linux.
+- The ARM dongle candidate was rebuilt after the review fixes. All 41 non-weak
+  shim imports resolve; inspected stock ABI hashes and image unpack/repack checks
+  passed. The unchanged head-unit artifact retains its earlier QNX build validation.
+- In the earlier broader run, repository tests passed through `vehicle_hook_test` on macOS. Its linker cannot
+  run `nav_boost_test` (`--wrap`); that test and the remaining suite passed on Linux.
+- OTA dry run: 4,143,616 bytes, 127 chunks, version 1172; no network upload.
+
+Images rebuilt after the identity change (only `model` is rewritten) and the
+head-unit wide-view switch:
+
+| file | marker | SHA-256 |
+|---|---|---|
+| `fw/hw301_v1172.tar` (release, newest image) | `v1172-20261027093548` | `6db930a21bc6458f2e133319dbf9da6ee78f8b42f9f48c8cbf82bb73b5295203` |
+| `fw/hw301_v1173.tar` (v1172 + logging) | `v1173-20261027093537` | `39a8ec6bf6db715e0b088d73a387edc3041980aa41b7ca90f42e8a4e1cee579a` |
+| `build/libaltscreen111_mhi2q.so` (head unit) | | `245a1ce70e5d9bc007c7449a7f4616a8ae9b5ebfdf08492f722ea3bc66e31e6c` |
+
+### First car test (2026-10-27, v1173)
+
+Dongle logs `work/logs/applogs-2026-10-27_10-00-46-*.tar`, an ~8.5-minute session;
+no head-unit logs were saved.
+
+- Car SETUP (7.317 s) precedes the car `/info` (7.422 s), as the model-SETUP
+  descriptor reset assumes. Stock CPAAProxyEx saw one display
+  (`Recv proxy disply count:1`).
+- The phone received the car's 111 descriptor, connected stream 111 and the
+  dongle connected the car's returned port 7100 with AES on (`head-unit relay aes on`).
+- 8,400 cluster frames, `bad=0 dropped=0 send_err=0`; every frame after the first
+  was relayed. 15-30 fps while moving, ~1 fps on a static map.
+- Two main-screen hand-overs to the MMI (110 teardown at 189.6 s / re-setup at
+  273.8 s; 384.0 s / 402.4 s) left stream 111 running without a reconnect.
+- MMI CarPlay, two calls, navigation prompts and two Siri sessions worked.
+- The car sent showUI/updateViewArea only at connect (7.8 s / 8.0 s), so no
+  layout or menu switch was exercised in this session.
+- Cluster picture restarts: at 428-461 s iOS re-sent the video config ~6 times on
+  both streams together (route guidance start); at 235-262 s the car sent ~8
+  forceKeyFrame requests while the MMI showed the Audi screen. Cause of the
+  latter needs the head-unit log.
+- The kmsg ring kept only the last ~15 KB: lines before 10.6 s (`LOADED`,
+  `native SETUP`, `native car display accepted`, `independent AES ready`) were
+  already overwritten, mostly by the periodic frame-rate lines.
 
 ## Platform
 
@@ -89,7 +265,7 @@ iPhone ==Wi-Fi AirPlay==> HW301 (receiver: libAirPlay) ==USB CarPlay==> MHI2Q
   `dmesg.log` from `getlogs.py`. The kmsg ring is small, so pull logs right after a test,
   before unplugging the dongle.
 
-## Phone side (dongle = AirPlay receiver)
+## Historical v1167 phone side (dongle = AirPlay receiver)
 
 ### What iOS needs to open a cluster stream
 - In `/info` (`AirPlayCopyServerInfo` hook):
@@ -136,7 +312,7 @@ of frames, `nal_ok=1 bad=0`):
 - The stream has about one IDR. A late joiner needs `forceKeyFrame`, sent with
   `AirPlayReceiverSessionSendCommand` and a no-op completion (never NULL).
 
-## Head-unit side (dongle = CarPlay client)
+## Historical v1167 head-unit side (dongle = CarPlay client)
 
 - CPAAProxyEx is a **single-screen bridge**:
   - one head-unit video socket (global 0x17e418, written by `_AirPlayClientSendSetupScreenCommandCompletion` FUN_0005c7ec only for type 0x6e);
@@ -168,7 +344,7 @@ of frames, `nal_ok=1 bad=0`):
 - Nonce desync: after 5 consecutive verify failures, the 111 socket is closed and iOS re-SETUPs
   with a fresh counter.
 
-## Cluster content and layout
+## Historical v1167 cluster content and layout
 
 - URL per cockpit layout (v1167):
   - wide (ViewArea 0, also `initialURL`): `maps:/car/instrumentcluster?showETA=yes&showSpeedLimit=yes&showCompass=yes`
@@ -226,13 +402,37 @@ of frames, `nal_ok=1 bad=0`):
 | 1164 | release: third ViewArea (Sport skin small map 566,64,360,300), classic 520,64,400,300, `initialURL` without `maneuverLayout=rightAligned` (`build_dual.sh release`, `v1164-20261021080230`). Sport ViewArea *car test pending* | archived `fw/hw301_v1164.tar` |
 | **1166** | release: v1164 + no ETA (`showETA=no`) + `KEYF` back-channel key frame requests and a late key frame 3 s after the relay attaches; fixes the blank cockpit map after a cold start (`build_dual.sh release`, `v1166-20261021090922`). *Car test pending* | archived `fw/hw301_v1166.tar` |
 | **1167** | release: v1166 + per-layout URL: wide = ETA, speed limit and compass; classic / Sport = turn card only; `showUI` on a layout change (`build_dual.sh release`, `v1167-20261025192423`). *Car test pending* | archived `fw/hw301_v1167.tar` |
+| 1168-1171 | private `hw301Cluster` `/info` extension, HELLO/KEY1 rekey and URL1 back-channel (release, optA and Input-key variants) | superseded by 1172, not shipped |
+| **1172** | native proxy: car display and commands passed through, own 111 ID/port/AES, `model=HW301` with stock `18D70` (`build_dual.sh release`, `v1172-20261027093548`). First car pass 2026-10-27 (as 1173) | **newest image**, `fw/hw301_v1172.tar` |
+| 1173 | **same version as v1172**, also contains enabled logging (`build_dual.sh optA`, `v1173-20261027093537`). First car pass 2026-10-27 | `fw/hw301_v1173.tar` |
 
 ## Open items
 
-- **Keystream reuse on the USB hop.** Streams 110 and 111 share one AES-CTR key and IV, because
-  111 reuses 110's connection id. Someone with a capture of the internal dongle↔head-unit link
-  could XOR the two streams. Over the air (ChaCha) is unaffected. The fix is a KDF that both
-  ends apply, e.g. `SHA512(key110 || "cluster111")[:16]`. It is not written yet.
+- **Main-screen validation, remaining part.** The 2026-10-27 test confirmed MMI
+  CarPlay, Siri, calls and prompts with the candidate identity and the SETUP before
+  `/info` order. Unplug/replug and phone Wi-Fi loss/reconnect are still open.
+  Incoming mixed display/stream filtering still fails closed if allocating its
+  filtered copy fails, rather than exposing 111 to the stock single-screen
+  parser. Host tests cover that SETUP failure; main-screen continuity under
+  memory pressure remains unverified on hardware.
+- **v1172 native on-car validation, remaining part.** Main-only teardown/re-setup
+  passed twice. Still open: the head-unit log line `model=HW301` and the 111
+  connection ID (no head-unit log was saved), cold start, phone-only Wi-Fi loss,
+  111-only reconnect, car reconnect, dynamic URL/layout switches (including the
+  wide-view switch) and suggestUI round trips. Save the head-unit log in the same
+  session as the dongle log.
+- **Siri start cut.** The car answered the dongle's speech audio SETUP
+  (`audio_type=5`, 16 kHz mono with microphone) after 1.91 s and 1.58 s, against
+  0.06-0.36 s for media and prompts, while iOS was already speaking. Likely
+  pre-existing; no earlier log has a Siri session. Options: hold the phone-facing
+  speech SETUP reply until the car's completes, or buffer up to ~2 s. Needs a
+  head-unit log to see where the car spends the time.
+- **Car key frame requests during MMI screen changes.** ~8 forceKeyFrame in 25 s
+  while the MMI showed the Audi screen, each restarting the cluster picture.
+  Check the head-unit resync logic against `altscreen111.log`.
+- **Dongle log volume.** The frame-rate line (every 10 s and every 300 frames),
+  the per-config line and `phone screen security` overwrite the start of the
+  session in the small kmsg ring. Rate-limit them when the logging is next touched.
 - **Automatic fallback.** If iOS rejects the session three times in a row, serve stock `/info`.
   The counter would live in a file on `/mnt/UDISK`. Not implemented: today a bad build needs a
   bench reflash.
@@ -245,7 +445,9 @@ of frames, `nal_ok=1 bad=0`):
 - Binary-patching CPAAProxyEx into a two-screen pipeline: there is no code cave beyond a dead
   routine (FUN_000acdb0), the type register is dead at the socket store, and the change cannot
   be bisected.
-- Making the head unit advertise two displays to the dongle (count:2): the head unit ends the session.
+- Feeding two displays directly into the unmodified stock proxy ended the session.
+  v1172 revisits native advertisement with a replacement boundary that hides 111
+  from both stock parsers and owns its socket/crypto separately.
 - Mirror build (v1129, gate-NOP at file offset 0x4c9a8): it shows the main screen on the VC. Superseded.
 - Carlinkit firmware (ludwig-v repo) is the same single-screen bridge, so there was nothing to borrow.
 

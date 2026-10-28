@@ -4,17 +4,14 @@
 #
 #   build_dual.sh [target]      target = release | release-input | optA | optA-input
 #
-#   release        -> hw301_v1167.tar  shipped image: HU_DIRECT, diagnostics off
-#   release-input  -> hw301_v1163.tar  same, Input ChaCha key (fallback only)
-#   optA           -> hw301_v1160.tar  release + enabled logging (archived fw/ copy is v1162 source)
-#   optA-input     -> hw301_v1155.tar  optA with the Input key (fallback only)
+#   release        -> hw301_v1172.tar  native proxy candidate, diagnostics off
+#   release-input  -> hw301_v1174.tar  Input ChaCha key diagnostic
+#   optA           -> hw301_v1173.tar  native proxy candidate + logging
+#   optA-input     -> hw301_v1175.tar  logging + Input key diagnostic
 #
-# Flash on BENCH power only:
-#   python3 work/tools/flash_local.py work/out/hw301_v<code>.tar --version <code>
-# Roll back any time with fw/hw301_v129.tar --version 129 (see README.md).
-#
-# Every target keeps HU_DIRECT=1. A step-3 image without it injects stream 111
-# into CPAAProxyEx and kills the session in ~0.6 s (v1150). Do not build one.
+# Every target replaces the single-screen proxy boundary. Stream 111 uses
+# native /info, SETUP and /command, with its own socket and encryption state.
+# Builds produce images only; no flashing or device access.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -24,14 +21,14 @@ build_step() {
   WRAP_LIB=libCoreUtils.so \
   CHECK_SYM=AirPlayReceiverSessionSetup \
   CLUSTER_SRC=cluster_dual.c \
-  CLUSTER_CFLAGS="-DCLUSTER_STEP=3 -DCLUSTER_ADVERT=3 -DSTEP_DECRYPT=1 -DHU_DIRECT=1 ${extra}" \
+  CLUSTER_CFLAGS="-DCLUSTER_STEP=3 -DCLUSTER_ADVERT=3 -DSTEP_DECRYPT=1 ${extra}" \
     ./work/tools/build.sh 129 "$code"
 }
 
 case "${1:-release}" in
-  release)       build_step 1167 "-DCLUSTER_DIAG=0" ;;
-  release-input) build_step 1163 "-DCLUSTER_DIAG=0 -DCLUSTER_KEY_INPUT=1" ;;
-  optA)          build_step 1160 ;;
-  optA-input)    build_step 1155 "-DCLUSTER_KEY_INPUT=1" ;;
+  release)       build_step 1172 "-DCLUSTER_DIAG=0" ;;
+  release-input) build_step 1174 "-DCLUSTER_DIAG=0 -DCLUSTER_KEY_INPUT=1" ;;
+  optA)          build_step 1173 ;;
+  optA-input)    build_step 1175 "-DCLUSTER_KEY_INPUT=1" ;;
   *) echo "usage: $0 [release|release-input|optA|optA-input]"; exit 1 ;;
 esac

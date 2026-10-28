@@ -166,11 +166,16 @@ Marker files (`/mnt/app/root/`): `mibr-carplay111-zoom.inverted` flips the steer
 direction ([steering-wheel](../input/steering-wheel.md)); `mibr-carplay111-viewareas.single`
 uses one ViewArea; `mibr-carplay111-noadvertise.senders` lists extra senders (one
 `model osBuildVersion` line, `*` = any build) that get the stock `/info`. The known wireless
-dongle (`model=iPhone9,1`, `osBuildVersion=18D70`) is built in: it never requests stream 111 and
-drops the session when it sees the advertisement.
+legacy dongle persona (`model=iPhone9,1`, `osBuildVersion=18D70`) is built in:
+that firmware never requests stream 111 and drops the session when it sees the
+advertisement. These listed senders retain the legacy AES listener. The native
+HW301 proxy candidate reports `model=HW301` and uses the ordinary two-display
+SETUP/command path. `viewareas.single` gives it one car-provided view; it does
+not disable the cluster.
 
 **Cluster URL content is set by four GEM switches** (*Cluster map turn card / ETA / speed limit /
-compass ON / OFF*), independent of route guidance. Each is a value file in `/mnt/app/root/`; absent = default:
+compass ON / OFF*), independent of route guidance, plus a fifth one with priority (*Cluster map all
+features on wide view ON / OFF*). Each is a value file in `/mnt/app/root/`; absent = default:
 
 | file `mibr-carplay111-nav.…` | default | values |
 | --- | --- | --- |
@@ -178,12 +183,15 @@ compass ON / OFF*), independent of route guidance. Each is a value file in `/mnt
 | `showETA` | `no` | `yes` / `no` |
 | `showSpeedLimit` | `no` | `yes` / `no` / `user` (follows the iPhone's Maps setting; file only) |
 | `showCompass` | `no` | `yes` / `no` / `user` (follows the iPhone's Maps setting; file only) |
+| `wideAll` | `no` | `yes` = on the wide view (ViewArea 0) turn card, ETA, speed limit and compass are all ON, whatever the four files above say; the classic and Sport small maps keep using them. `no` = the four switches apply to every view |
 
 Defaults give `maps:/car/instrumentcluster?showETA=no&showSpeedLimit=no&showCompass=no`; turn card off gives
 `maps:/car/instrumentcluster/map?showETA=…&maneuverLayout=no&showSpeedLimit=…&showCompass=…`. With our BAP/KDK arrow
 active the phone's turn card is therefore shown as well unless the turn-card switch is OFF. A GEM press
 with a session up (`command_ready=1` in `/tmp/mibr-alt111-gen2.status`) re-sends `showUI` through
-`/tmp/mibr-alt111-show-only`; otherwise it applies at the next connection. When an app starts
+`/tmp/mibr-alt111-show-only`; otherwise it applies at the next connection. With `wideAll=yes` the URL
+depends on the cockpit layout: a switch between the wide view and a small map sends `showUI` with the
+new URL first, then `updateViewArea`. When an app starts
 guidance and iOS hands it the cluster, iOS sends `suggestUI`; 1 s later the hook answers with
 `showUI` (then `updateViewArea` and `forceKeyFrame`) so that app gets the current URL too (issue #35:
 without it Waze drew no ETA after a reconnect). Java still sends

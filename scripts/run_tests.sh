@@ -111,6 +111,9 @@ cc -std=c99 -O2 -Wall -Wextra -Werror -pedantic -Ialtscreen_hook/include \
     tests/alt111_control_test.c altscreen_hook/src/alt111_control.c -o "$OUT/alt111_control"
 "$OUT/alt111_control"
 
+printf '%-32s ' hw301_bridge_tests
+sh scripts/test_hw301.sh
+
 printf '%-32s ' aa_navxlate_test
 cc -std=gnu99 -O1 -Wall -Wextra -Werror -Wno-unused-function \
     tests/aa_navxlate_test.c -o "$OUT/aa_navxlate"

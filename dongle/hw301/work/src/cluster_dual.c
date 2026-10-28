@@ -1,78 +1,16 @@
-/*
- * cluster_dual.c - HW301 dedicated Virtual Cockpit (CarPlay stream 111).
- *
- * One wrapper-rename shim installed as libCoreUtils.so (stock renamed to
- * libCoreUtilsReal.so). CPAAProxyEx NEEDs libCoreUtils.so before libAirPlay.so,
- * so this object precedes libAirPlay in musl's lookup order and can interpose
- * libAirPlay's PLT exports as well as CPAAProxyEx's CoreUtils imports;
- * dlsym(RTLD_NEXT) reaches the real libAirPlay and the real libCoreUtils.
- *
- *   iPhone ==Wi-Fi AirPlay==> HW301 (receiver: libAirPlay) ==USB CarPlay==> MHI2Q
- *     110 -> stock path ------------------------------------------------> 110 (stock)
- *     111 -> [this shim] listen, decrypt --> re-encrypt, connect -------> 111 (altscreen hook :7100)
- *
- * Phone side (dongle = AirPlay receiver):
- *   - AirPlayCopyServerInfo: advertise a 1440x540 type-111 cluster display.
- *   - AirPlayReceiverSessionSetup: stock skips type 111 (switch type-100 0..10);
- *     after stock succeeds, open our own listener and append dataPort+streamID
- *     to the stock response (as libaltscreen111_gen2.c does on the head unit).
- *   - key: the wireless screen is ChaCha20-Poly1305, not the AES master.
- *     STEP_DECRYPT derives the 32-byte stream key with PairingSessionDeriveKey
- *     (session+0x3ec, salt "DataStream-Salt"<cid>) and opens each VIDEO_FRAME
- *     with libCoreUtils chacha20_poly1305_*. Layout is pinned in
- *     FINDINGS.md ("Phone side: ChaCha20-Poly1305").
- *
- * Head-unit side (dongle = CarPlay client; NO CPAAProxyEx patch):
- *   - CFArrayEnsureCreatedAndAppend: clone the SetupScreen stream 110 dict as
- *     type 111 (old mirror experiment). Stock CPAAProxyEx then skips 111, so the
- *     single head-unit socket slot is never clobbered. The clone keeps 110's
- *     streamConnectionID, so the head unit derives the same key for 111 as 110.
- *   - that key is captured where CPAAProxyEx derives it: AES_CTR_Init called
- *     from SetupProxyScreenSecurityInfo.
- *   - the head-unit 111 port defaults to 7100, or /mnt/UDISK/cluster_hu.port.
- *     That number must match the head unit's /mnt/app/cluster_hu.port. The
- *     hook binds only that port for the dongle; it does not try another.
- *     The head-unit address is the peer of the
- *     dongle's stream-110 data socket (peer port 6030).
- *
- * Relay (step 3, and only once STEP_DECRYPT has produced plaintext): phone 111
- * VIDEO_FRAME bodies are ChaCha-opened, then sealed the way other dongles seal
- * a screen toward the head unit. This firmware logs "use aes ctr security", so
- * the seal is AES-CTR of the whole AVCC access unit (SendProxyScreenFrame's
- * AES_CTR_Update of the sample; that function's 4-byte rewrite only replaces
- * an Annex-B start code, and this buffer is already AVCC). No Poly1305 tag.
- * VIDEO_CONFIG stays plaintext. One head-unit connection is kept across phone
- * reconnects. The captured key is stream 110's: the direct path does not
- * inject a second screen, and the head-unit hook derives 111 from that same
- * connection id.
- *
- * Step is chosen at BUILD time (no dongle shell needed): -DCLUSTER_STEP=N
- *   1  advertise the cluster display to the iPhone + log SETUP/keys only
- *   2  + open the 111 listener, append its dataPort, receive and decrypt, count
- *   3  + inject 111 to the head unit and relay (full dual screen)  [default]
- * Each step is its own flashable image; validate with getlogs -> dmesg.log.
- *
- * Optional runtime overrides (only if you DO get a dongle shell; files on
- * /mnt/UDISK, which survives flashing - not needed for the normal flow):
- *   cluster_dual.off       everything stock (pure pass-through)
- *   cluster_dual.noinject  force off: no 111 in the SETUP to the head unit
- *   cluster_dual.norelay   force off: receive+decrypt but never touch the HU
- *   (viewAreas are always advertised now - required by iOS, see v1142 result)
- *   cluster_dual.plainhu   send plain (unencrypted) frames to the head unit
- *   cluster_dump.on        dump decrypted 111 AUs to /mnt/UDISK/c111.h264 (~2MB)
- * Port override: cluster_hu.port
- * To disable without a shell, flash stock fw/hw301_v129.tar.
- *
- * Logs -> /dev/kmsg (getlogs.py pulls dmesg.log; app.log loses late appends).
- *
- * Build (produces an image, does not flash): work/tools/build_dual.sh release
- * (or optA for the same image with bring-up diagnostics).
+/* HW301 native second-screen proxy replacement (stock v129 ABI).
+ * Stock CPAAProxyEx keeps its main display/socket. This shim owns stream 111:
+ * it consumes the car's normal /info display, adds a separate native SETUP,
+ * hides 111 from the single-screen stock parser, and relays authenticated
+ * phone video with the car session's independently derived stream key.
+ * Controls travel through /command in both directions, without a private
+ * head-unit protocol. See FINDINGS.md for ABI evidence and validation limits.
  */
 #ifndef CLUSTER_STEP
 #define CLUSTER_STEP 3
 #endif
 #define STEP_RECEIVE (CLUSTER_STEP >= 2)   /* listen, append dataPort, count frames */
-#define STEP_RELAY   (CLUSTER_STEP >= 3)   /* inject 111 to the HU and forward */
+#define STEP_RELAY   (CLUSTER_STEP >= 3)   /* negotiate native car 111 and relay video */
 
 /* Phase A (step 2a) is transport only: frames are counted, not decrypted.
  * Phase B (step 2b, v1148) sets STEP_DECRYPT=1 and opens VIDEO_FRAME with the
@@ -91,17 +29,6 @@
  * (build_dual.sh release). Status, error and 10 s frame-rate lines stay. */
 #ifndef CLUSTER_DIAG
 #define CLUSTER_DIAG 1
-#endif
-
-/* Phase C direct path (HU_DIRECT): do NOT inject 111 into the dongle->head-unit
- * SetupScreen (that makes stock CPAAProxyEx a 2-screen bridge and crashes the
- * session, v1150). The relay connects to the head unit :7100 itself and seals
- * each AU with the AES-CTR key captured from SetupProxyScreenSecurityInfo —
- * the same key other dongles install for the screen, and the same key the
- * head-unit hook derives for stream 110's connection id. cluster_dual.plainhu
- * is the only plaintext escape. See FINDINGS.md ("Head-unit side"). */
-#ifndef HU_DIRECT
-#define HU_DIRECT 0
 #endif
 
 /* Which /info edits to apply (step 1 found iOS ends the session right after our
@@ -133,119 +60,21 @@
 #define UTF8 0x08000100
 #define TYPE_MAIN 110
 #define TYPE_CLUSTER 111
-/* Advertised cluster geometry. Overridable at build time per cluster variant
- * (e.g. the larger MIBSI geometry): build_dual.sh passes -DCLUSTER_W=... etc.
- * Defaults are the B9 Virtual Cockpit 1440x540, 290x108 mm. */
-#ifndef CLUSTER_W
-#define CLUSTER_W 1440
-#endif
-#ifndef CLUSTER_H
-#define CLUSTER_H 540
-#endif
-#ifndef CLUSTER_FPS
-#define CLUSTER_FPS 30
-#endif
-#ifndef CLUSTER_WMM
-#define CLUSTER_WMM 290
-#endif
-#ifndef CLUSTER_HMM
-#define CLUSTER_HMM 108
-#endif
-#define CLUSTER_UUID "b7e6c5a0-2222-4000-8000-000000000002"
-/* The INITIAL URL decides what the phone renders into the cluster video. The
- * bare URL gives a plain map with no maneuver/ETA (the arrow was missing). The
- * head-unit hook uses showETA + maneuverLayout for a real iPhone, which makes
- * the phone draw the turn card and ETA into the cluster itself. Match that,
- * without maneuverLayout: rightAligned pinned the card to the SafeArea's right
- * edge and the app moved the puck left of it (issue #20; on the Sport skin the
- * card also went behind the rev counter). No ETA on the cockpit (v1166): the
- * root URL still keeps the turn card with showETA=no.
- * Per cockpit layout (v1167): the wide view gets ETA, speed limit and compass;
- * the classic and Sport small maps keep the bare turn card (no room, and on the
- * Sport skin they sat behind the rev counter). The initial URL is the wide one
- * (initialViewArea 0); a VIEW change re-sends showUI when the URL differs.
- * Override with -DCLUSTER_URL_WIDE=... / -DCLUSTER_URL_SMALL=... (e.g. the
- * RGI-on bare /map when the head unit draws its own maneuver). */
-#ifndef CLUSTER_URL_WIDE
-#define CLUSTER_URL_WIDE "maps:/car/instrumentcluster?showETA=yes&showSpeedLimit=yes&showCompass=yes"
-#endif
-#ifndef CLUSTER_URL_SMALL
-#define CLUSTER_URL_SMALL "maps:/car/instrumentcluster?showETA=no&showSpeedLimit=no&showCompass=no"
-#endif
-#ifndef CLUSTER_URL_INITIAL
-#define CLUSTER_URL_INITIAL CLUSTER_URL_WIDE
-#endif
-/* URL the phone was last given for the cluster: initialURL on every /info,
- * then each showUI. Global, so a new stream-111 thread after a showUI does not
- * re-send it again. */
-static const char *volatile g_cur_url = CLUSTER_URL_INITIAL;
-#define URL_CLUSTER "maps:/car/instrumentcluster"
-#define URL_MAP "maps:/car/instrumentcluster/map"
-#define URL_CARD "maps:/car/instrumentcluster/instructioncard"
-
-/* SafeArea per view, matching the head-unit hook's calibrated A5 values
- * (ALT111_DEFAULT_SAFE_* wide, _SMALL_SAFE_* classic, _SPORT_SAFE_* Sport skin
- * small map). Wide height is 270, not the canvas 540: the dials cover the rest.
- * The small maps are 300 tall (rows 64..364): narrower than ~498 px, iOS needs
- * that height or it hides third-party apps' turn card and ETA. Overridable per cockpit at build time. */
-#ifndef CLUSTER_SAFE0_X
-#define CLUSTER_SAFE0_X 360
-#endif
-#ifndef CLUSTER_SAFE0_Y
-#define CLUSTER_SAFE0_Y 87
-#endif
-#ifndef CLUSTER_SAFE0_W
-#define CLUSTER_SAFE0_W 720
-#endif
-#ifndef CLUSTER_SAFE0_H
-#define CLUSTER_SAFE0_H 270
-#endif
-#ifndef CLUSTER_SAFE1_X
-#define CLUSTER_SAFE1_X 520
-#endif
-#ifndef CLUSTER_SAFE1_Y
-#define CLUSTER_SAFE1_Y 64
-#endif
-#ifndef CLUSTER_SAFE1_W
-#define CLUSTER_SAFE1_W 400
-#endif
-#ifndef CLUSTER_SAFE1_H
-#define CLUSTER_SAFE1_H 300
-#endif
-#ifndef CLUSTER_SAFE2_X
-#define CLUSTER_SAFE2_X 566
-#endif
-#ifndef CLUSTER_SAFE2_Y
-#define CLUSTER_SAFE2_Y 64
-#endif
-#ifndef CLUSTER_SAFE2_W
-#define CLUSTER_SAFE2_W 360
-#endif
-#ifndef CLUSTER_SAFE2_H
-#define CLUSTER_SAFE2_H 300
-#endif
+/* The car owns the complete display descriptor. No local geometry fallback:
+ * an older/malformed head-unit profile leaves normal CarPlay available. */
+#define MAX_VIEWS 64
+#define URL_CAP 1024
 
 #define OFF_FILE "/mnt/UDISK/cluster_dual.off"
-#define NOINJECT_FILE "/mnt/UDISK/cluster_dual.noinject"
 #define NORELAY_FILE "/mnt/UDISK/cluster_dual.norelay"
-#define PLAINHU_FILE "/mnt/UDISK/cluster_dual.plainhu"
 #define DUMP_FILE "/mnt/UDISK/cluster_dump.on"
 #define DUMP_PATH "/mnt/UDISK/c111.h264"
-/* Same number as the head unit's /mnt/app/cluster_hu.port. Default 7100. */
-#define HU_PORT_FILE "/mnt/UDISK/cluster_hu.port"
 
 #define PHONE_PORT 7100          /* preferred phone-facing listener port */
-#define HU_PORT_DEFAULT 7100     /* head-unit altscreen hook default (MHI2Q) */
-#define HU_MAIN_PEER_PORT 6030   /* dongle's stream-110 data socket peer port */
-#define HU_CONTROL_PEER_PORT 5000 /* dongle's AirPlay control socket peer port */
 #define HU_CONNECT_MS 1000       /* runs on the phone read path: keep it short */
 #define HU_RETRY_S 5             /* pre-connect retry interval */
 #define HU_MAX_TRIES 12          /* per head-unit key generation (~1 min) */
 #define HU_WRITE_MS 60           /* max per-frame wait for the head-unit socket; else drop */
-#define VIEW_COUNT 3             /* advertised ViewAreas (wide, classic, sport) */
-#define BC_MAGIC "VIEW"          /* head-unit -> dongle back-channel: "VIEW" + u32 LE index */
-#define BC_KEYF "KEYF"           /* back-channel: "KEYF" + u32 (ignored), head-unit decoder wants an IDR */
-#define KF_MIN_S 1               /* at most one back-channel key frame request per second */
 #define KF_LATE_S 3              /* one more key frame this long after the relay attaches */
 #define SPSSI_SIZE 0x2b8         /* SetupProxyScreenSecurityInfo span, v129 */
 
@@ -271,14 +100,12 @@ typedef union { uint64_t align; unsigned char bytes[512]; } AesCtx;
 _Static_assert(sizeof(ScreenHeader) == HDR_SIZE, "screen header must be 128 bytes");
 
 /* ---- real functions (resolved lazily) ---------------------------------- */
-static void (*r_ensure)(void **, const void *);
 static int64_t (*r_get_i64)(CFRef, CFRef, OSStatus *);
 static OSStatus (*r_ctr_init)(void *, const uint8_t *, const uint8_t *);
 static OSStatus (*r_ctr_update)(void *, const void *, size_t, void *);
 static void (*r_ctr_final)(void *);
 static CFRef (*r_info)(void *, void *, void *, OSStatus *);
 static OSStatus (*r_setup)(void *, CFRef, CFRef *);
-static OSStatus (*r_set_security)(void *, const uint8_t *, const uint8_t *);
 static void (*r_teardown)(void *, CFRef, OSStatus, void *);
 static OSStatus (*r_send_cmd)(void *, CFRef, void *, void *);
 static void (*r_derive)(const void *, size_t, uint64_t, uint8_t *, uint8_t *);
@@ -318,15 +145,35 @@ static const void *array_cb, *dict_key_cb, *dict_val_cb, *bool_false;
 /* introspection (optional; resolved best-effort, not required by the hooks) */
 static void (*cf_dict_apply)(CFRef, void (*)(CFRef, CFRef, void *), void *);
 static CFRef (*cf_num_create)(CFRef, int, const void *);   /* CFNumberCreate, for adjacentViewAreas */
-static int64_t (*cf_get_i64)(CFRef);
+static int64_t (*cf_get_i64)(CFRef, OSStatus *);
 static unsigned long (*cf_number_type)(void);
 static unsigned long (*cf_boolean_type)(void);
 static unsigned long (*cf_data_type)(void);
 
 static CFRef k_type, k_conn, k_streams, k_displays, k_features;
+static CFRef (*r_plist_read)(const void *, size_t, OSStatus *);
+static CFRef g_car_display;             /* owned immutable snapshot, under g_lock */
+static int g_car_port;
+static void *(*r_plist_write)(CFRef, size_t *, OSStatus *);
+static void (*r_client_invalidate)(void *);
+static OSStatus (*r_peer_address)(void *, void *, size_t, void *);
+static void **r_car_client;
+static const uint8_t *r_car_master;
+static void **r_car_pair;
+static struct sockaddr_storage g_car_addr;
+static socklen_t g_car_addr_len;
+static uint64_t g_car_cid, g_car_main_cid;
+static uint8_t g_car_master[16];
+static int g_car_pending;
+static void car_reset(int forget_display);
+static int car_needs_setup(void);
+static void capture_car_command(CFRef request);
+static void service_car_commands(void *session, unsigned gen);
+
 
 /* address range of CPAAProxyEx's SetupProxyScreenSecurityInfo, for caller test */
 static uintptr_t g_spssi_lo, g_spssi_hi;
+static uintptr_t g_createplist_lo, g_createplist_hi;
 static void *g_cpaa_base;        /* dli_fbase of a CPAAProxyEx symbol */
 
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
@@ -335,9 +182,7 @@ static __thread int t_busy;
 
 /* ---- shared session state ---------------------------------------------- */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t g_master[16];
-static int g_master_valid;
-static uint8_t g_hu_key[16], g_hu_iv[16];   /* head-unit 111 key (== stream 110) */
+static uint8_t g_hu_key[16], g_hu_iv[16];   /* car stream-111 key: independent connection ID */
 static int g_hu_key_valid;
 /* Two independent generations. A phone-side 111 SETUP or teardown retires the
  * receiver thread (g_rx_gen). A head-unit screen re-setup only re-keys the
@@ -375,8 +220,13 @@ static int disabled(void) {
  * unresolved symbol, so CPAAProxyEx would exit at startup: no hostapd (AP),
  * no USB gadget, no Wi-Fi flashing. Bind the original names explicitly;
  * build.sh also rejects any shim that imports a *time64 symbol. */
+#ifdef HW301_HOST_TEST
+#define dlsym_plain dlsym
+#define time_plain time
+#else
 void *dlsym_plain(void *__restrict, const char *__restrict) __asm__("dlsym");
 long time_plain(long *) __asm__("time");
+#endif
 
 static void *next_sym(const char *name) {
     void *p = dlsym_plain(RTLD_NEXT, name);
@@ -406,14 +256,12 @@ static void bind_all(void) {
     Dl_info di;
     void *spssi;
 #define NEED(dst, name) do { *(void **)&(dst) = next_sym(name); if (!(dst)) { dlog("missing %s", name); return; } } while (0)
-    NEED(r_ensure, "CFArrayEnsureCreatedAndAppend");
     NEED(r_get_i64, "CFDictionaryGetInt64");
     NEED(r_ctr_init, "AES_CTR_Init");
     NEED(r_ctr_update, "AES_CTR_Update");
     NEED(r_ctr_final, "AES_CTR_Final");
     NEED(r_info, "AirPlayCopyServerInfo");
     NEED(r_setup, "AirPlayReceiverSessionSetup");
-    NEED(r_set_security, "AirPlayReceiverSessionSetSecurityInfo");
     NEED(r_teardown, "AirPlayReceiverSessionTearDown");
     NEED(r_send_cmd, "AirPlayReceiverSessionSendCommand");
     NEED(r_derive, "AirPlay_DeriveAESKeySHA512ForScreen");
@@ -455,6 +303,11 @@ static void bind_all(void) {
     *(void **)&cf_boolean_type = next_sym("CFBooleanGetTypeID");
     *(void **)&cf_data_type = next_sym("CFDataGetTypeID");
 
+    *(void **)&r_peer_address = next_sym("HTTPClientGetPeerAddress");
+    r_car_client = dlsym_plain(RTLD_DEFAULT, "gAirPlayClient");
+    r_car_master = dlsym_plain(RTLD_DEFAULT, "gSessionAesKey");
+    r_car_pair = dlsym_plain(RTLD_DEFAULT, "gPairVerifySessionHomeKit");
+
     /* SetupProxyScreenSecurityInfo is a CPAAProxyEx (executable) export */
     spssi = dlsym_plain(RTLD_DEFAULT, "SetupProxyScreenSecurityInfo");
     if (spssi && dladdr(spssi, &di)) {
@@ -462,6 +315,9 @@ static void bind_all(void) {
         g_spssi_hi = (uintptr_t)spssi + SPSSI_SIZE;
         g_cpaa_base = di.dli_fbase;
     }
+    spssi = dlsym_plain(RTLD_DEFAULT, "CreateHTTPRequestMsgWithPList");
+    g_createplist_lo = (uintptr_t)spssi;
+    g_createplist_hi = g_createplist_lo + 0x190; /* verified v129 symbol size */
 
 #if STEP_DECRYPT
     chacha_resolve();   /* best-effort; decrypt bails later if any pointer is NULL */
@@ -519,10 +375,6 @@ static void set_value(CFRef d, const char *key, CFRef v) {
     CFRef k = s_cf(key);
     if (k) { cf_dict_set(d, k, v); cf_release(k); }
 }
-static void remove_key(CFRef d, const char *key) {
-    CFRef k = s_cf(key);
-    if (k) { cf_dict_remove(d, k); cf_release(k); }
-}
 static int ascii_eq(CFRef v, const char *want) {
     char buf[64];
     const char *p = 0;
@@ -568,14 +420,194 @@ static int caller_is_cpaa(void *ra) {
     return dladdr(ra, &di) && di.dli_fbase == g_cpaa_base;
 }
 
+/* ---- car-owned profile, captured at CPAAProxyEx's /info plist decode ---- */
+static CFRef get_value(CFRef d, const char *name) {
+    CFRef k, v = 0;
+    if (!is_type(d, cf_dict_type)) return 0;
+    k = s_cf(name);
+    if (k) { v = cf_dict_get(d, k); cf_release(k); }
+    return v;
+}
+
+static int get_int(CFRef d, const char *name, int64_t lo, int64_t hi, int64_t *out) {
+    CFRef k, v = get_value(d, name);
+    OSStatus e = -1;
+    int64_t n;
+    if (!is_type(v, cf_number_type)) return 0;
+    k = s_cf(name);
+    if (!k) return 0;
+    n = r_get_i64(d, k, &e);
+    cf_release(k);
+    if (e || n < lo || n > hi) return 0;
+    *out = n;
+    return 1;
+}
+
+static int get_string(CFRef d, const char *name, char *out, size_t cap) {
+    CFRef v = get_value(d, name);
+    out[0] = 0;
+    return is_type(v, cf_string_type) && cf_cstr_get &&
+           cf_cstr_get(v, out, (long)cap, UTF8) && out[0];
+}
+
+static int valid_rect(CFRef d, int64_t w, int64_t h) {
+    int64_t x, y, rw, rh;
+    return get_int(d, "originXPixels", 0, w - 1, &x) &&
+           get_int(d, "originYPixels", 0, h - 1, &y) &&
+           get_int(d, "widthPixels", 1, w - x, &rw) &&
+           get_int(d, "heightPixels", 1, h - y, &rh);
+}
+
+/* Validate the fields we consume; preserve every other car-provided field.
+ * viewAreas and initialURL are optional in the native display descriptor. */
+static int valid_car_display(CFRef d) {
+    int64_t w, h, initial;
+    CFRef areas;
+    char uuid[64];
+    long i, count;
+    if (dict_type(d) != TYPE_CLUSTER ||
+        !get_int(d, "widthPixels", 1, 16384, &w) ||
+        !get_int(d, "heightPixels", 1, 16384, &h) ||
+        !get_string(d, "uuid", uuid, sizeof uuid) || strlen(uuid) != 36) return 0;
+    areas = get_value(d, "viewAreas");
+    if (!areas) return 1;
+    if (!is_type(areas, cf_array_type)) return 0;
+    count = cf_array_count(areas);
+    if (count < 1 || count > MAX_VIEWS ||
+        !get_int(d, "initialViewArea", 0, count - 1, &initial)) return 0;
+    for (i = 0; i < count; ++i) {
+        CFRef area = cf_array_get(areas, i), safe = get_value(area, "safeArea");
+        int64_t aw, ah;
+        if (!valid_rect(area, w, h) ||
+            !get_int(area, "widthPixels", 1, w, &aw) ||
+            !get_int(area, "heightPixels", 1, h, &ah) ||
+            (safe && !valid_rect(safe, aw, ah))) return 0;
+    }
+    return 1;
+}
+
+/* Own the returned copy; never mutate a caller's array/dictionary. In particular,
+ * an empty streams array must not accidentally become a full stock TEARDOWN. */
+static CFRef without_cluster(CFRef root, const char *field) {
+    CFRef old = get_value(root, field), copy, arr;
+    long i;
+    if (!is_type(old, cf_array_type)) return 0;
+    copy = cf_dict_copy(0, 0, root);
+    arr = cf_array_new(0, 0, array_cb);
+    if (!copy || !arr) { if (copy) cf_release(copy); if (arr) cf_release(arr); return 0; }
+    for (i = 0; i < cf_array_count(old); ++i) {
+        CFRef item = cf_array_get(old, i);
+        if (dict_type(item) != TYPE_CLUSTER) cf_array_append(arr, item);
+    }
+    set_value(copy, field, arr);
+    cf_release(arr);
+    return copy;
+}
+
+static void capture_car_info(CFRef info) {
+    CFRef displays = get_value(info, "displays"), copy = 0, old;
+    long i;
+    if (!is_type(displays, cf_array_type)) return;
+    for (i = 0; i < cf_array_count(displays); ++i) {
+        CFRef d = cf_array_get(displays, i);
+        if (valid_car_display(d)) { copy = cf_dict_copy(0, 0, d); break; }
+    }
+    pthread_mutex_lock(&g_lock);
+    old = g_car_display;
+    g_car_display = copy;
+    pthread_mutex_unlock(&g_lock);
+    if (old) cf_release(old);
+    if (!copy) car_reset(0);
+    dlog("native car display %s", copy ? "accepted" : "unavailable");
+}
+
+static void capture_car_setup(CFRef response) {
+    CFRef sd = find_stream(response, TYPE_CLUSTER);
+    int64_t port;
+    uint64_t cid;
+    struct sockaddr_storage sa;
+    int peer_ok = 0;
+    if (!sd) return;
+    memset(&sa, 0, sizeof sa);
+    if (r_peer_address && r_car_client && *r_car_client)
+        peer_ok = r_peer_address(*r_car_client, &sa, sizeof sa, 0) == 0;
+    cid = dict_cid(sd);
+    pthread_mutex_lock(&g_lock);
+    if (g_car_pending && (!cid || cid == g_car_cid)) {
+        g_car_pending = 0;
+        if (get_int(sd, "dataPort", 1, 65535, &port) && peer_ok &&
+            (sa.ss_family == AF_INET || sa.ss_family == AF_INET6)) {
+            g_car_port = (int)port;
+            g_car_addr = sa;
+            g_car_addr_len = sa.ss_family == AF_INET6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+            dlog("native car SETUP 111 cid=%llu port=%d", (unsigned long long)g_car_cid, g_car_port);
+        } else {
+            /* No usable transport was established. Release the pending ID so
+             * a later main SETUP negotiates 111 again with a fresh ID/key. */
+            g_car_cid = 0; g_car_main_cid = 0;
+            g_car_port = 0; g_car_addr_len = 0; g_hu_key_valid = 0;
+            memset(g_car_master, 0, sizeof g_car_master);
+            memset(g_hu_key, 0, sizeof g_hu_key); memset(g_hu_iv, 0, sizeof g_hu_iv);
+            dlog("native car SETUP 111 invalid port/peer; retry on next screen SETUP");
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+CFRef CFBinaryPlistV0CreateWithData(const void *data, size_t len, OSStatus *err) {
+    CFRef result, filtered = 0;
+    void *ra = __builtin_return_address(0);
+    if (!r_plist_read) *(void **)&r_plist_read = next_sym("CFBinaryPlistV0CreateWithData");
+    if (!r_plist_read) { if (err) *err = -1; return 0; }
+    result = r_plist_read(data, len, err);
+    if (result && !t_busy && ready() && !disabled() && caller_is_cpaa(ra)) {
+        t_busy = 1;
+        if (is_type(get_value(result, "displays"), cf_array_type)) {
+            capture_car_info(result);
+            filtered = without_cluster(result, "displays");
+        } else if (find_stream(result, TYPE_CLUSTER)) {
+            capture_car_setup(result);
+            filtered = without_cluster(result, "streams");
+        } else capture_car_command(result);
+        /* Never expose 111 to the stock parser on an allocation failure. */
+        if (is_type(get_value(result, "displays"), cf_array_type) || find_stream(result, TYPE_CLUSTER)) {
+            cf_release(result);
+            result = filtered;
+            if (!result && err) *err = -1;
+        }
+        t_busy = 0;
+    }
+    return result;
+}
+
+static int car_available(void) {
+    int have;
+    pthread_mutex_lock(&g_lock);
+    have = g_car_display != 0;
+    pthread_mutex_unlock(&g_lock);
+    return have;
+}
+
+static int car_view_count(void) {
+    int count = 0;
+    pthread_mutex_lock(&g_lock);
+    if (g_car_display && is_type(get_value(g_car_display, "viewAreas"), cf_array_type))
+        count = (int)cf_array_count(get_value(g_car_display, "viewAreas"));
+    pthread_mutex_unlock(&g_lock);
+    return count;
+}
+
+static void set_car_uuid(CFRef params) {
+    pthread_mutex_lock(&g_lock);
+    if (g_car_display) set_value(params, "uuid", get_value(g_car_display, "uuid"));
+    pthread_mutex_unlock(&g_lock);
+}
+
 /* ============ PHONE SIDE: /info advertisement ============ */
-static void merge_features(CFRef info) {
+static void merge_features(CFRef info, int want_va) {
     CFRef existing = cf_dict_get(info, k_features), copy, alt = 0, va = 0;
     long i, n = 0;
-    /* viewAreas always: every head-unit session where iOS accepted the cluster
-     * advertised it (root feature + per-display viewAreas); v1142 without it
-     * was torn down by the phone ~100 ms after /info. */
-    int have_alt = 0, have_va = 0, want_va = 1;
+    int have_alt = 0, have_va = 0;
     if (is_type(existing, cf_array_type)) {
         copy = cf_array_copy(0, 0, existing);
         if (copy) n = cf_array_count(copy);
@@ -594,61 +626,6 @@ static void merge_features(CFRef info) {
     if (va) cf_release(va);
     if (alt) cf_release(alt);
     cf_release(copy);
-}
-
-/* One view area: full 1440x540 canvas with a safe area, policy booleans false.
- * Identical to the head-unit hook's add_reference_viewarea (carplay_logs/021). */
-static void add_view(CFRef areas, int sx, int sy, int sw, int sh) {
-    CFRef view = cf_dict_new(0, 0, dict_key_cb, dict_val_cb);
-    CFRef safe = cf_dict_new(0, 0, dict_key_cb, dict_val_cb);
-    if (view && safe) {
-        set_i64(view, "widthPixels", CLUSTER_W);
-        set_i64(view, "heightPixels", CLUSTER_H);
-        set_i64(view, "originXPixels", 0);
-        set_i64(view, "originYPixels", 0);
-        set_i64(safe, "widthPixels", sw);
-        set_i64(safe, "heightPixels", sh);
-        set_i64(safe, "originXPixels", sx);
-        set_i64(safe, "originYPixels", sy);
-        set_value(view, "drawUIOutsideSafeArea", (CFRef)bool_false);
-        set_value(view, "viewAreaTransitionControl", (CFRef)bool_false);
-        set_value(view, "safeArea", safe);
-        cf_array_append(areas, view);
-    }
-    if (safe) cf_release(safe);
-    if (view) cf_release(view);
-}
-
-static void add_views(CFRef alt) {
-    CFRef areas = cf_array_new(0, 0, array_cb);
-    if (!areas) return;
-    /* SafeArea = where the phone keeps the puck/turn card so the dials do not
-     * cover them. These must match the head-unit hook's calibrated values for
-     * this cockpit (ALT111_DEFAULT_SAFE_* / _SMALL_SAFE_* / _SPORT_SAFE_*), in the
-     * same order as the hook's ViewArea indices (the VIEW back-channel sends
-     * the index only); the dongle advertised
-     * height 297 vs the real 270, so content landed too low/wide (car photo). */
-    add_view(areas, CLUSTER_SAFE0_X, CLUSTER_SAFE0_Y, CLUSTER_SAFE0_W, CLUSTER_SAFE0_H); /* [0] wide */
-    add_view(areas, CLUSTER_SAFE1_X, CLUSTER_SAFE1_Y, CLUSTER_SAFE1_W, CLUSTER_SAFE1_H); /* [1] classic */
-    add_view(areas, CLUSTER_SAFE2_X, CLUSTER_SAFE2_Y, CLUSTER_SAFE2_W, CLUSTER_SAFE2_H); /* [2] sport */
-    set_value(alt, "viewAreas", areas);
-    set_i64(alt, "initialViewArea", 0);
-    cf_release(areas);
-}
-
-static void add_urls(CFRef alt) {
-    CFRef urls = cf_array_new(0, 0, array_cb);
-    CFRef a = s_cf(URL_CLUSTER), b = s_cf(URL_MAP), c = s_cf(URL_CARD);
-    if (urls && a && b && c) {
-        cf_array_append(urls, a);
-        cf_array_append(urls, b);
-        cf_array_append(urls, c);
-        set_value(alt, "altScreenSuggestUIURLs", urls);
-    }
-    if (c) cf_release(c);
-    if (b) cf_release(b);
-    if (a) cf_release(a);
-    if (urls) cf_release(urls);
 }
 
 static int already_cluster(CFRef displays) {
@@ -676,7 +653,7 @@ static void describe(CFRef v, char *out, size_t cap) {
         }
         snprintf(out, cap, "\"%s\"", b);
     } else if (cf_number_type && tid == cf_number_type()) {
-        snprintf(out, cap, "%lld", (long long)(cf_get_i64 ? cf_get_i64(v) : 0));
+        snprintf(out, cap, "%lld", (long long)(cf_get_i64 ? cf_get_i64(v, 0) : 0));
     } else if (cf_boolean_type && tid == cf_boolean_type()) {
         snprintf(out, cap, "%s", (v == bool_false) ? "false" : "true");
     } else if (cf_array_type && tid == cf_array_type()) {
@@ -719,49 +696,34 @@ static void log_info_dict(CFRef base) {
 
 /* Return a new info dict, or 0 to keep base. Caller releases base on success. */
 static CFRef augment_info(CFRef base) {
-    CFRef info, old, displays, stock, alt;
+    CFRef info, old, displays, alt;
+    int have_profile;
     if (!ADVERT_FEATURES && !ADVERT_DISPLAY) return 0;   /* stock /info (log only) */
     if (!is_type(base, cf_dict_type)) return 0;
     old = cf_dict_get(base, k_displays);
     if (!is_type(old, cf_array_type) || cf_array_count(old) < 1) return 0;
     if (already_cluster(old)) return 0;
+    pthread_mutex_lock(&g_lock);
+    have_profile = g_car_display != 0;
+    pthread_mutex_unlock(&g_lock);
+    if (!have_profile) return 0;
     info = cf_dict_copy(0, 0, base);
     if (!info) return 0;
-    if (ADVERT_FEATURES) merge_features(info);
+    if (ADVERT_FEATURES) merge_features(info, car_view_count() > 0);
     if (!ADVERT_DISPLAY) {
         dlog("/info enabledFeatures merged, display not added (ADVERT=%d)", CLUSTER_ADVERT);
         return info;
     }
     displays = cf_array_copy(0, 0, old);
-    stock = cf_array_get(old, 0);
-    alt = is_type(stock, cf_dict_type) ? cf_dict_copy(0, 0, stock) : 0;
+    pthread_mutex_lock(&g_lock);
+    alt = g_car_display ? cf_dict_copy(0, 0, g_car_display) : 0;
+    pthread_mutex_unlock(&g_lock);
     if (!displays || !alt) {
         if (displays) cf_release(displays);
         if (alt) cf_release(alt);
         cf_release(info);
         return 0;
     }
-    remove_key(alt, "primaryInputDevice");
-    remove_key(alt, "edid");
-    remove_key(alt, "platformLayer");
-    remove_key(alt, "avcc");
-    remove_key(alt, "xOffset");
-    remove_key(alt, "yOffset");
-    remove_key(alt, "windowWidth");
-    remove_key(alt, "windowHeight");
-    set_i64(alt, "type", TYPE_CLUSTER);
-    set_i64(alt, "maxFPS", CLUSTER_FPS);
-    set_i64(alt, "features", 0);
-    set_i64(alt, "widthPixels", CLUSTER_W);
-    set_i64(alt, "heightPixels", CLUSTER_H);
-    set_i64(alt, "widthPhysical", CLUSTER_WMM);
-    set_i64(alt, "heightPhysical", CLUSTER_HMM);
-    set_str(alt, "uuid", CLUSTER_UUID);
-    /* no "displayUUID": the stock display and the head-unit hook's both use only "uuid" */
-    set_str(alt, "initialURL", CLUSTER_URL_INITIAL);
-    g_cur_url = CLUSTER_URL_INITIAL;
-    add_urls(alt);
-    add_views(alt);
     cf_array_append(displays, alt);
     cf_dict_set(info, k_displays, displays);
     dlog("/info cluster display added displays=%ld", cf_array_count(displays));
@@ -788,22 +750,7 @@ CFRef AirPlayCopyServerInfo(void *session, void *properties, void *mac, OSStatus
     return edited;
 }
 
-/* ============ KEY CAPTURE ============ */
-/* Phone master key: AirPlayReceiverSessionSetSecurityInfo(session, key16, iv16). */
-OSStatus AirPlayReceiverSessionSetSecurityInfo(void *session, const uint8_t *key, const uint8_t *iv) {
-    OSStatus e;
-    if (!ready()) return r_set_security ? r_set_security(session, key, iv) : -1;
-    e = r_set_security(session, key, iv);
-    if (e == 0 && key && !disabled()) {
-        pthread_mutex_lock(&g_lock);
-        memcpy(g_master, key, 16);
-        g_master_valid = 1;
-        pthread_mutex_unlock(&g_lock);
-        dlog("phone master key captured");
-    }
-    return e;
-}
-
+/* ============ SCREEN SECURITY ============ */
 /* Which cipher does stock pick for the phone's 110 screen? (log-only; answers
  * U2 in step 1). A wireless session with pair-verify can use ChaCha for the
  * screen even when an AES master was set, and then the step-2 AES derivation
@@ -828,71 +775,131 @@ OSStatus AirPlayReceiverSessionScreen_SetChaChaSecurityInfo(void *screen, const 
     return r_scr_chacha(screen, key, len);
 }
 
-/* Head-unit 111 key: AES_CTR_Init called from SetupProxyScreenSecurityInfo.
- * The clone keeps 110's streamConnectionID, so 110's key == 111's key. */
+/* Confirm the car session master against stock's main-screen derivation before
+ * using it. gSessionAesKey is the SPSSI SHA512 input (v129 GOT 0x17e1a8).
+ * Reusing stream 110's *derived* key or connection ID would reuse CTR keystream. */
+static void capture_car_key(const uint8_t *key, const uint8_t *iv) {
+    uint8_t check_key[16], check_iv[16];
+    pthread_mutex_lock(&g_lock);
+    if (g_car_cid && g_car_main_cid && !g_hu_key_valid) {
+        r_derive(g_car_master, 16, g_car_main_cid, check_key, check_iv);
+        if (!memcmp(key, check_key, 16) && !memcmp(iv, check_iv, 16)) {
+            r_derive(g_car_master, 16, g_car_cid, g_hu_key, g_hu_iv);
+            g_hu_key_valid = 1;
+            dlog("native car 111 independent AES ready gen=%u", g_hu_gen);
+        } else dlog("car master verification failed; cluster remains closed");
+        memset(check_key, 0, sizeof check_key); memset(check_iv, 0, sizeof check_iv);
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
 OSStatus AES_CTR_Init(void *ctx, const uint8_t *key, const uint8_t *iv) {
     OSStatus e;
-    unsigned gen;
     void *ra = __builtin_return_address(0);
     if (!ready()) return r_ctr_init ? r_ctr_init(ctx, key, iv) : -1;
     e = r_ctr_init(ctx, key, iv);
-    if (e == 0 && key && iv && !disabled() && g_spssi_lo &&
-        (uintptr_t)ra >= g_spssi_lo && (uintptr_t)ra < g_spssi_hi) {
-        pthread_mutex_lock(&g_lock);
-        memcpy(g_hu_key, key, 16);
-        memcpy(g_hu_iv, iv, 16);
-        g_hu_key_valid = 1;
-        gen = ++g_hu_gen;        /* new head-unit SETUP -> relay reconnects + re-keys */
-        pthread_mutex_unlock(&g_lock);
-        dlog("head-unit screen key captured hu_gen=%u", gen);
-    }
+    if (!e && key && iv && !disabled() && g_spssi_lo &&
+        (uintptr_t)ra >= g_spssi_lo && (uintptr_t)ra < g_spssi_hi) capture_car_key(key, iv);
     return e;
 }
 
-/* ============ HEAD-UNIT SIDE: inject 111 into the SetupScreen streams ============ */
-void CFArrayEnsureCreatedAndAppend(void **ioArray, const void *value) {
-    void *ra = __builtin_return_address(0);
-    CFRef clone;
-    if (!r_ensure) { r_ensure = (void (*)(void **, const void *))next_sym("CFArrayEnsureCreatedAndAppend"); }
-    r_ensure(ioArray, value);                 /* normal append (main stream) */
-    if (!STEP_RELAY || HU_DIRECT) return;      /* 111->HU injection is step 3; HU_DIRECT relays directly, no inject */
-    if (!ready() || disabled() || flag(NOINJECT_FILE)) return;
-    if (t_busy || !ioArray || !*ioArray || !value) return;
-    if (!caller_is_cpaa(ra)) return;
-    if (!is_type((CFRef)value, cf_dict_type)) return;
-    if (!cf_dict_get((CFRef)value, k_conn)) return;        /* must be a stream dict */
-    {   /* clone the main stream only. The old mirror shim matched on
-         * streamConnectionID alone, so also accept a dict whose "type" is not
-         * set yet at append time; reject any other explicit type. */
-        int t = dict_type((CFRef)value);
-        if (t != TYPE_MAIN && t != -1) return;
+static int random_cid(uint64_t *cid) {
+    size_t off = 0;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    while (off < sizeof *cid) {
+        ssize_t n = read(fd, (uint8_t *)cid + off, sizeof *cid - off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); return 0; }
+        off += (size_t)n;
     }
-    t_busy = 1;
-    clone = cf_dict_copy(0, 0, (CFRef)value);
-    if (clone) {
-        set_i64(clone, "type", TYPE_CLUSTER);              /* keep streamConnectionID */
-        r_ensure(ioArray, clone);
-        cf_release(clone);
-        dlog("injected head-unit cluster stream type=111");
+    close(fd);
+    return *cid != 0;
+}
+
+/* Called only for CPAA's HTTP plist serialization. Add 111 to the first screen
+ * SETUP. Main-only teardown/re-setup does not own the independent car stream. */
+static CFRef car_request(CFRef request) {
+    CFRef main = find_stream(request, TYPE_MAIN), out = 0, streams = 0, alt = 0, display = 0;
+    uint64_t cid, main_cid = dict_cid(main);
+    if (get_value(request, "model")) {
+        car_reset(1);
+        out = cf_dict_copy(0, 0, request);
+        if (out) {
+            /* Only the model changes: the head unit's legacy guard needs both
+             * iPhone9,1 and 18D70, and the car keeps the stock iOS build string. */
+            set_str(out, "model", "HW301");
+            /* Both features are implemented; actual display data arrives in /info. */
+            merge_features(out, 1);
+        }
+        return out;
     }
-    t_busy = 0;
+    if (!main_cid || find_stream(request, TYPE_CLUSTER) || !car_needs_setup()) return 0;
+    pthread_mutex_lock(&g_lock);
+    if (g_car_display) display = cf_retain(g_car_display);
+    pthread_mutex_unlock(&g_lock);
+    if (!display) return 0;
+    /* This USB transport uses stock AES. Do not silently downgrade a paired
+     * car transport to AES if a future firmware enables HomeKit here. */
+    if (!r_car_master || !r_car_pair || *r_car_pair) goto done;
+    out = cf_dict_copy(0, 0, request);
+    streams = cf_array_copy(0, 0, streams_of(request));
+    alt = cf_dict_new(0, 0, dict_key_cb, dict_val_cb);
+    if (!out || !streams || !alt) goto fail;
+    set_i64(alt, "type", TYPE_CLUSTER);
+    set_value(alt, "uuid", get_value(display, "uuid"));
+    if (!random_cid(&cid) || cid == main_cid) goto fail;
+    car_reset(0);
+    set_i64(alt, "streamConnectionID", (int64_t)cid);
+    if (get_value(display, "maxFPS")) set_value(alt, "maxFPS", get_value(display, "maxFPS"));
+    pthread_mutex_lock(&g_lock);
+    g_car_cid = cid; g_car_main_cid = main_cid; g_car_pending = 1;
+    memcpy(g_car_master, r_car_master, 16);
+    pthread_mutex_unlock(&g_lock);
+    dlog("native SETUP main=%llu cluster=%llu", (unsigned long long)main_cid, (unsigned long long)cid);
+    cf_array_append(streams, alt);
+    set_value(out, "streams", streams);
+    goto done;
+fail:
+    if (out) cf_release(out);
+    out = 0;
+done:
+    if (alt) cf_release(alt);
+    if (streams) cf_release(streams);
+    cf_release(display);
+    return out;
+}
+
+void *CFBinaryPlistV0Create(CFRef request, size_t *len, OSStatus *err) {
+    CFRef edited = 0;
+    void *data, *ra = __builtin_return_address(0);
+    if (!r_plist_write) *(void **)&r_plist_write = next_sym("CFBinaryPlistV0Create");
+    if (!r_plist_write) { if (err) *err = -1; return 0; }
+    if (!t_busy && ready() && !disabled() && caller_is_cpaa(ra) && g_createplist_hi &&
+        (uintptr_t)ra >= g_createplist_lo && (uintptr_t)ra < g_createplist_hi) {
+        t_busy = 1; edited = car_request(request); t_busy = 0;
+    }
+    data = r_plist_write(edited ? edited : request, len, err);
+    if (edited) cf_release(edited);
+    return data;
 }
 
 /* ---- socket helpers ---------------------------------------------------- */
-static int read_full(int fd, void *buf, size_t len, unsigned gen) {
+static int read_full(int fd, void *buf, size_t len, unsigned gen, int idle_return) {
     uint8_t *p = buf;
     size_t off = 0;
     while (off < len) {
+        int stale;
+        pthread_mutex_lock(&g_lock);
+        stale = gen != g_rx_gen;
+        pthread_mutex_unlock(&g_lock);
+        if (stale) return -1;
         struct pollfd pf = { fd, POLLIN, 0 };
         ssize_t r;
-        int pr = poll(&pf, 1, 1000);
+        int pr = poll(&pf, 1, 100);
         if (pr < 0) { if (errno == EINTR) continue; return -1; }
         if (pr == 0) {
-            int stale;
-            pthread_mutex_lock(&g_lock);
-            stale = (gen != g_rx_gen);
-            pthread_mutex_unlock(&g_lock);
-            if (stale) return -1;
+            if (off == 0 && idle_return) return 2;
             continue;
         }
         r = read(fd, p + off, len - off);
@@ -911,72 +918,47 @@ static int send_full(int fd, const void *buf, size_t len) {
         int pr = poll(&pf, 1, 2000);
         if (pr <= 0) return -1;
         w = send(fd, p + off, len - off, MSG_NOSIGNAL);
-        if (w <= 0) { if (w < 0 && errno == EINTR) continue; return -1; }
+        if (w <= 0) { if (w < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue; return -1; }
         off += (size_t)w;
     }
     return 0;
 }
 
 static int hu_port(void) {
-    char b[16];
-    int fd = open(HU_PORT_FILE, O_RDONLY | O_CLOEXEC), p = 0;
-    if (fd >= 0) {
-        ssize_t n = read(fd, b, sizeof b - 1);
-        close(fd);
-        if (n > 0) { b[n] = 0; p = atoi(b); }
-    }
-    return (p > 0 && p < 65536) ? p : HU_PORT_DEFAULT;
+    int port;
+    pthread_mutex_lock(&g_lock);
+    port = g_car_port;
+    pthread_mutex_unlock(&g_lock);
+    return port;
 }
 
-/* Find the head-unit address: the peer of the dongle's stream-110 data socket
- * (HU port 6030), else the peer of its AirPlay control socket (HU port 5000,
- * "Host:fe80::…%usb0:5000" in app.log). Both are outbound IPv6 link-local. */
-static int hu_addr(struct sockaddr_in6 *out) {
-    static const int ports[] = { HU_MAIN_PEER_PORT, HU_CONTROL_PEER_PORT };
-    unsigned i;
-    int fd;
-    for (i = 0; i < sizeof ports / sizeof ports[0]; i++) {
-        for (fd = 3; fd < 1024; fd++) {
-            struct sockaddr_in6 sa;
-            socklen_t sl = sizeof sa;
-            if (getpeername(fd, (struct sockaddr *)&sa, &sl) != 0) continue;
-            if (sa.sin6_family != AF_INET6) continue;
-            if (ntohs(sa.sin6_port) != ports[i]) continue;
-            *out = sa;                  /* keeps the %usb0 scope id */
-            return 1;
-        }
-    }
-    return 0;
-}
-
+/* The control client's negotiated peer preserves IPv6 scope IDs and supports
+ * IPv4 too. No socket scan, guessed address or fixed car-side port. */
 static int hu_connect(void) {
-    struct sockaddr_in6 sa;
-    int fd, one = 1;
+    struct sockaddr_storage sa;
+    socklen_t len;
+    int fd, one = 1, port, err = 0;
+    socklen_t el = sizeof err;
     long fl;
     struct pollfd pf;
-    if (!hu_addr(&sa)) { dlog("head-unit addr not found (no peer :6030/:5000)"); return -1; }
-    sa.sin6_port = htons((uint16_t)hu_port());
-    fd = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    pthread_mutex_lock(&g_lock);
+    sa = g_car_addr; len = g_car_addr_len; port = g_car_port;
+    pthread_mutex_unlock(&g_lock);
+    if (!len || port <= 0) return -1;
+    if (sa.ss_family == AF_INET6) ((struct sockaddr_in6 *)&sa)->sin6_port = htons((uint16_t)port);
+    else if (sa.ss_family == AF_INET) ((struct sockaddr_in *)&sa)->sin_port = htons((uint16_t)port);
+    else return -1;
+    fd = socket(sa.ss_family, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) return -1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     fl = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0 && errno != EINPROGRESS) {
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) { close(fd); return -1; }
+    if (connect(fd, (struct sockaddr *)&sa, len) < 0 && errno != EINPROGRESS) { close(fd); return -1; }
+    pf.fd = fd; pf.events = POLLOUT; pf.revents = 0;
+    if (poll(&pf, 1, HU_CONNECT_MS) <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) < 0 || err) {
         close(fd); return -1;
     }
-    pf.fd = fd; pf.events = POLLOUT; pf.revents = 0;
-    if (poll(&pf, 1, HU_CONNECT_MS) <= 0) { close(fd); dlog("head-unit connect timeout"); return -1; }
-    {
-        int err = 0; socklen_t el = sizeof err;
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
-        if (err) { close(fd); dlog("head-unit connect err=%d", err); return -1; }
-    }
-    fcntl(fd, F_SETFL, fl);
-    {
-        char ip[64] = "?";
-        inet_ntop(AF_INET6, &sa.sin6_addr, ip, sizeof ip);
-        dlog("head-unit 111 connected %s%%%u:%u", ip, sa.sin6_scope_id, ntohs(sa.sin6_port));
-    }
+    dlog("native car 111 connected port=%d", port);
     return fd;
 }
 
@@ -995,71 +977,10 @@ static void ask_keyframe(void *session) {
     if (req && params) {
         OSStatus e;
         set_str(req, "type", "forceKeyFrame");
-        set_str(params, "uuid", CLUSTER_UUID);
+        set_car_uuid(params);
         set_value(req, "params", params);
         e = r_send_cmd(session, req, (void *)kf_done, 0);
         dlog("forceKeyFrame requested rc=%d", e);
-    }
-    if (params) cf_release(params);
-    if (req) cf_release(req);
-}
-
-/* Forward a cockpit layout change to the phone: updateViewArea{viewAreaIndex}.
- * Same send path as ask_keyframe. adjacentViewAreas (the other advertised
- * indices, as CFNumbers) is required or iOS acks but keeps the old layout. */
-__attribute__((unused)) static void send_view(void *session, int view) {
-    CFRef req, params, adj = 0;
-    if (!session || !r_send_cmd || view < 0 || view >= VIEW_COUNT) return;
-    req = cf_dict_new(0, 0, dict_key_cb, dict_val_cb);
-    params = cf_dict_new(0, 0, dict_key_cb, dict_val_cb);
-    if (req && params) {
-        OSStatus e;
-        int v;
-        set_str(req, "type", "updateViewArea");
-        set_str(params, "uuid", CLUSTER_UUID);
-        set_i64(params, "viewAreaIndex", view);
-        set_i64(params, "animationDurationMillis", 0);
-        if (cf_num_create && (adj = cf_array_new(0, 0, array_cb))) {
-            for (v = 0; v < VIEW_COUNT; v++) {
-                int64_t idx = v;
-                CFRef num;
-                if (v == view) continue;
-                num = cf_num_create(0, 4 /* kCFNumberSInt64Type */, &idx);
-                if (num) { cf_array_append(adj, num); cf_release(num); }
-            }
-            set_value(params, "adjacentViewAreas", adj);
-        }
-        set_value(req, "params", params);
-        e = r_send_cmd(session, req, (void *)kf_done, 0);
-        dlog("updateViewArea -> phone index=%d rc=%d", view, e);
-    }
-    if (adj) cf_release(adj);
-    if (params) cf_release(params);
-    if (req) cf_release(req);
-}
-
-/* Cluster content for a cockpit layout: index 0 = wide, 1 = classic, 2 = Sport. */
-static const char *view_url(int view) {
-    return view == 0 ? CLUSTER_URL_WIDE : CLUSTER_URL_SMALL;
-}
-
-/* Ask the phone for new cluster content: showUI{uuid, url}, the command the
- * head-unit hook sends for a GEM switch press. Same send path as ask_keyframe.
- * Sent before updateViewArea so the layout is applied last. */
-__attribute__((unused)) static void send_showui(void *session, const char *url) {
-    CFRef req, params;
-    if (!session || !r_send_cmd || !url) return;
-    req = cf_dict_new(0, 0, dict_key_cb, dict_val_cb);
-    params = cf_dict_new(0, 0, dict_key_cb, dict_val_cb);
-    if (req && params) {
-        OSStatus e;
-        set_str(req, "type", "showUI");
-        set_str(params, "uuid", CLUSTER_UUID);
-        set_str(params, "url", url);
-        set_value(req, "params", params);
-        e = r_send_cmd(session, req, (void *)kf_done, 0);
-        g_cur_url = url;
-        dlog("showUI -> phone url=%s rc=%d", url, e);
     }
     if (params) cf_release(params);
     if (req) cf_release(req);
@@ -1169,7 +1090,7 @@ static int chacha_derive(void *session, uint64_t cid, uint8_t key[32]) {
     int n;
     OSStatus e;
     if (!session || !chacha_resolve()) return 0;
-    pair = *(void **)((char *)session + 0x3ec);
+    memcpy(&pair, (char *)session + 0x3ec, sizeof pair);
     if (!pair) { dlog("pairing session at +0x3ec is NULL"); return 0; }
     n = snprintf(salt, sizeof salt, "DataStream-Salt%llu", (unsigned long long)cid);
     if (n <= 0 || (size_t)n >= sizeof salt) return 0;
@@ -1218,7 +1139,7 @@ static int chacha_open(const uint8_t key[32], uint8_t nonce[8],
 }
 #endif
 
-struct rx_arg { int listen_fd; unsigned gen; uint64_t cid; void *session; };
+struct rx_arg { int listen_fd; unsigned gen; uint64_t cid; void *session; uint8_t key[32]; };
 
 static void dump_au(int *dfd, size_t *dn, const uint8_t *p, size_t n) {
     if (!flag(DUMP_FILE)) return;
@@ -1229,17 +1150,16 @@ static void dump_au(int *dfd, size_t *dn, const uint8_t *p, size_t n) {
     }
 }
 
-/* ---- head-unit relay (shared) -------------------------------------------
- * The head-unit hook accepts ONE stream-111 connection per head-unit SETUP and
- * closes its listener when that connection ends. The relay socket therefore
- * belongs to the process, not to a receiver thread: it survives an iPhone 111
- * reconnect (new receiver thread) and is dropped only on a send failure or when
- * a new head-unit SETUP re-keys it (g_hu_gen). Only the current receiver
- * (rx_gen == g_rx_gen) may write; g_relay_lock serializes. */
+/* ---- car relay (shared) -------------------------------------------------
+ * A native streamConnectionID owns one socket and continuous CTR state. The
+ * relay survives phone reconnects and main-screen-only teardown/re-setup;
+ * replacing its socket requires a fresh native SETUP and independent key/IV.
+ * Only the current phone receiver (rx_gen == g_rx_gen) may write, serialized by
+ * g_relay_lock. Car invalidation or a new 111 SETUP advances g_hu_gen. */
 static pthread_mutex_t g_relay_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct {
     int fd;              /* -1 = no socket */
-    int enc;             /* ctx valid (else plain, cluster_dual.plainhu) */
+    int enc;             /* independent AES context valid */
     AesCtx ctx;          /* head-unit AES-CTR, continuous for the socket's life */
     unsigned for_gen;    /* g_hu_gen the socket / tries belong to */
     int dead;            /* gave up for for_gen; revived by the next g_hu_gen */
@@ -1248,8 +1168,6 @@ static struct {
     int nokey_logged;
     unsigned long relayed, err, dropped;
     int backlog;             /* consecutive drops; 0 after a successful send */
-    uint8_t bc[8];           /* back-channel accumulator (VIEW / KEYF message) */
-    int bc_len;
 } g_relay = { .fd = -1 };
 
 static void relay_drop_locked(int dead) {
@@ -1258,43 +1176,150 @@ static void relay_drop_locked(int dead) {
     if (g_relay.enc) { r_ctr_final(&g_relay.ctx); g_relay.enc = 0; }
     g_relay.dead = dead;
     g_relay.backlog = 0;
-    g_relay.bc_len = 0;
 }
 
-/* Non-blocking read of the head-unit back-channel. Returns the ViewArea index
- * when a full VIEW message arrives, else -1; *keyframe is set on a KEYF message.
- * The head unit sends VIEW on the stream-111 socket when the cockpit layout
- * changes, and KEYF when its decoder attaches after the phone's IDR has passed
- * (cold start: the renderer comes up after the dongle's stream). */
-__attribute__((unused)) static int relay_poll_bc(int *keyframe) {
-    int view = -1;
-    *keyframe = 0;
+static int car_needs_setup(void) {
+    int need;
     pthread_mutex_lock(&g_relay_lock);
-    if (g_relay.fd >= 0) {
-        struct pollfd pf = { g_relay.fd, POLLIN, 0 };
-        while (view < 0 && poll(&pf, 1, 0) == 1 && (pf.revents & POLLIN)) {
-            ssize_t r = recv(g_relay.fd, g_relay.bc + g_relay.bc_len,
-                             (size_t)(8 - g_relay.bc_len), MSG_DONTWAIT);
-            if (r <= 0) break;
-            g_relay.bc_len += (int)r;
-            if (g_relay.bc_len == 8) {
-                if (memcmp(g_relay.bc, BC_MAGIC, 4) == 0) {
-                    view = g_relay.bc[4] | (g_relay.bc[5] << 8) |
-                           (g_relay.bc[6] << 16) | (g_relay.bc[7] << 24);
-                    g_relay.bc_len = 0;
-                } else if (memcmp(g_relay.bc, BC_KEYF, 4) == 0) {
-                    *keyframe = 1;
-                    g_relay.bc_len = 0;
-                } else {                       /* resync: drop the first byte */
-                    memmove(g_relay.bc, g_relay.bc + 1, 7);
-                    g_relay.bc_len = 7;
-                }
-            }
-            pf.revents = 0;
+    pthread_mutex_lock(&g_lock);
+    need = !g_car_cid || (g_relay.for_gen == g_hu_gen && g_relay.dead);
+    pthread_mutex_unlock(&g_lock);
+    pthread_mutex_unlock(&g_relay_lock);
+    return need;
+}
+
+/* Preserve the complete native command, including UUID, adjacency and any
+ * future fields. UI/view intent survives a phone reconnect, but never crosses
+ * a car session. Stock's generic phone->car delegate already forwards suggestUI.
+ * Acknowledgments below belong to the phone command completion, not submission. */
+static struct car_control {
+    CFRef request;
+    unsigned version, delivered_gen, delivered_version, inflight;
+    long next_try;
+} g_controls[3]; /* showUI/stopUI, updateViewArea, forceKeyFrame */
+/* The completion owns its ticket. Do not free it on teardown: stock may still
+ * call back, and command_done must safely reject the stale generation. If stock
+ * discards the completion, this allocation remains (at most three per abandoned
+ * generation, not a process-wide bound across repeated reconnects). */
+struct command_ticket { unsigned slot, version, gen, car_gen, ui_version; };
+
+static int cluster_command_slot(CFRef request) {
+    CFRef type = get_value(request, "type"), params = get_value(request, "params");
+    char uuid[64], expected[64];
+    int match;
+    if (!get_string(params, "uuid", uuid, sizeof uuid)) return -1;
+    pthread_mutex_lock(&g_lock);
+    match = get_string(g_car_display, "uuid", expected, sizeof expected) && !strcmp(uuid, expected);
+    pthread_mutex_unlock(&g_lock);
+    if (!match) return -1;
+    if (ascii_eq(type, "showUI")) {
+        char url[URL_CAP];
+        return get_string(params, "url", url, sizeof url) ? 0 : -1;
+    }
+    if (ascii_eq(type, "stopUI")) return 0;
+    if (ascii_eq(type, "updateViewArea")) return 1;
+    if (ascii_eq(type, "forceKeyFrame")) return 2;
+    return -1;
+}
+
+static void capture_car_command(CFRef request) {
+    int slot = cluster_command_slot(request);
+    CFRef copy, old;
+    if (slot < 0 || !(copy = cf_dict_copy(0, 0, request))) return;
+    pthread_mutex_lock(&g_lock);
+    old = g_controls[slot].request;
+    g_controls[slot].request = copy;
+    ++g_controls[slot].version;
+    pthread_mutex_unlock(&g_lock);
+    if (old) cf_release(old);
+}
+
+static void command_done(OSStatus err, CFRef response, void *context) {
+    struct command_ticket *t = context;
+    struct car_control *c;
+    (void)response;
+    pthread_mutex_lock(&g_lock);
+    c = &g_controls[t->slot];
+    if (t->car_gen == g_hu_gen && c->inflight == t->gen) {
+        c->inflight = 0;
+        if (!err && (t->slot != 1 || t->ui_version == g_controls[0].version)) {
+            c->delivered_gen = t->gen; c->delivered_version = t->version;
+            /* A successful UI change may reset the phone's layout. Reapply the
+             * car's exact view command once; failed UI attempts never do this. */
+            if (t->slot == 0 && t->version == c->version) g_controls[1].delivered_gen = 0;
         }
     }
+    pthread_mutex_unlock(&g_lock);
+    if (err) dlog("car command slot=%u completion=%d; retry after 1s", t->slot, err);
+    free(t);
+}
+
+static void service_car_commands(void *session, unsigned gen) {
+    unsigned i;
+    long now = time_plain(0);
+    for (i = 0; i < 3; ++i) {
+        struct command_ticket *t;
+        struct car_control *c;
+        CFRef request;
+        OSStatus e;
+        pthread_mutex_lock(&g_lock);
+        c = &g_controls[i];
+        if (gen != g_rx_gen || !c->request || c->inflight || now < c->next_try ||
+            (c->delivered_gen == gen && c->delivered_version == c->version) ||
+            (i == 1 && g_controls[0].request &&
+             (g_controls[0].delivered_gen != gen ||
+              g_controls[0].delivered_version != g_controls[0].version))) {
+            pthread_mutex_unlock(&g_lock);
+            continue;
+        }
+        t = malloc(sizeof *t);
+        if (!t) { pthread_mutex_unlock(&g_lock); return; }
+        t->slot = i; t->version = c->version; t->gen = gen; t->car_gen = g_hu_gen;
+        t->ui_version = g_controls[0].version;
+        request = cf_retain(c->request);
+        c->next_try = now + 1; c->inflight = gen;
+        pthread_mutex_unlock(&g_lock);
+        e = r_send_cmd(session, request, (void *)command_done, t);
+        cf_release(request);
+        if (e) command_done(e, 0, t);
+    }
+}
+
+OSStatus AirPlayReceiverSessionSendCommand(void *session, CFRef request, void *completion, void *context) {
+    void *ra = __builtin_return_address(0);
+    if (!ready()) return r_send_cmd ? r_send_cmd(session, request, completion, context) : -1;
+    /* The CPAA parser already cached these commands at decode. Bypass only its
+     * fire-and-forget call: our worker supplies a completion and retries errors. */
+    if (!disabled() && !completion && caller_is_cpaa(ra) && cluster_command_slot(request) >= 0) return 0;
+    return r_send_cmd(session, request, completion, context);
+}
+
+static void car_reset(int forget_display) {
+    unsigned i;
+    pthread_mutex_lock(&g_relay_lock);
+    relay_drop_locked(1);
+    pthread_mutex_lock(&g_lock);
+    ++g_hu_gen;
+    g_car_port = 0; g_car_addr_len = 0; g_car_pending = 0;
+    g_car_cid = 0; g_car_main_cid = 0; g_hu_key_valid = 0;
+    memset(g_car_master, 0, sizeof g_car_master);
+    memset(g_hu_key, 0, sizeof g_hu_key); memset(g_hu_iv, 0, sizeof g_hu_iv);
+    if (forget_display) {
+        if (g_car_display) cf_release(g_car_display);
+        g_car_display = 0;
+    }
+    for (i = 0; i < 3; ++i) {
+        if (g_controls[i].request) cf_release(g_controls[i].request);
+        memset(&g_controls[i], 0, sizeof g_controls[i]);
+    }
+    pthread_mutex_unlock(&g_lock);
     pthread_mutex_unlock(&g_relay_lock);
-    return view;
+}
+
+void HTTPClientInvalidate(void *client) {
+    if (!r_client_invalidate) *(void **)&r_client_invalidate = next_sym("HTTPClientInvalidate");
+    if (ready() && !disabled() && r_car_client && client == *r_car_client) car_reset(1);
+    if (r_client_invalidate) r_client_invalidate(client);
 }
 
 static int relay_current(unsigned rx_gen) {
@@ -1309,10 +1334,13 @@ static int relay_current(unsigned rx_gen) {
  * receiver as attached (so relay_frame does not replay it again) and returns 1
  * when the caller should request a key frame (first config on a reused socket). */
 static int relay_config(unsigned rx_gen, int *thread_attached, const ScreenHeader *h, const uint8_t *body) {
-    int want_kf = 0;
+    int want_kf = 0, current;
     if (!relay_current(rx_gen)) return 0;
     pthread_mutex_lock(&g_relay_lock);
-    if (g_relay.fd >= 0) {
+    pthread_mutex_lock(&g_lock);
+    current = rx_gen == g_rx_gen && g_relay.for_gen == g_hu_gen;
+    pthread_mutex_unlock(&g_lock);
+    if (g_relay.fd >= 0 && current) {
         if (send_full(g_relay.fd, h, sizeof *h) != 0 || send_full(g_relay.fd, body, h->bodySize) != 0) {
             g_relay.err++;
             relay_drop_locked(1);
@@ -1333,14 +1361,18 @@ static int relay_frame(unsigned rx_gen, int *thread_attached, ScreenHeader *h, u
     uint8_t key[16], iv[16];
     unsigned cur;
     int have, want_kf = 0;
-    if (!relay_current(rx_gen)) return 0;
+    pthread_mutex_lock(&g_relay_lock);
     pthread_mutex_lock(&g_lock);
+    if (rx_gen != g_rx_gen) {
+        pthread_mutex_unlock(&g_lock);
+        pthread_mutex_unlock(&g_relay_lock);
+        return 0;
+    }
     cur = g_hu_gen;
-    have = g_hu_key_valid;
+    have = g_hu_key_valid && g_car_port > 0;
     if (have) { memcpy(key, g_hu_key, 16); memcpy(iv, g_hu_iv, 16); }
     pthread_mutex_unlock(&g_lock);
 
-    pthread_mutex_lock(&g_relay_lock);
     if (cur != g_relay.for_gen) {           /* new head-unit SETUP: fresh key, fresh tries */
         if (g_relay.fd >= 0) dlog("head-unit re-keyed (hu_gen %u->%u); reconnecting", g_relay.for_gen, cur);
         relay_drop_locked(0);
@@ -1350,7 +1382,7 @@ static int relay_frame(unsigned rx_gen, int *thread_attached, ScreenHeader *h, u
     }
     if (!have && !g_relay.nokey_logged) {
         g_relay.nokey_logged = 1;
-        dlog("relay: no head-unit screen key captured yet (111 not injected, or SPSSI caller check missed)");
+        dlog("relay: waiting for native car SETUP port/key");
     }
     if (g_relay.fd < 0 && have && !g_relay.dead) {
         long now = time_plain(0);
@@ -1359,16 +1391,11 @@ static int relay_frame(unsigned rx_gen, int *thread_attached, ScreenHeader *h, u
             g_relay.tries++;
             g_relay.fd = hu_connect();
             if (g_relay.fd >= 0) {
-                /* Same AES-CTR context other dongles init in SetupProxyScreenSecurityInfo.
-                 * plainhu is the only way a frame leaves unencrypted. */
-                int plain = flag(PLAINHU_FILE);
-                /* Fresh context. A reused socket has already been AES_CTR_Final'd
-                 * in relay_drop_locked; init must start the counter at this IV. */
                 memset(&g_relay.ctx, 0, sizeof g_relay.ctx);
-                g_relay.enc = (!plain && r_ctr_init(&g_relay.ctx, key, iv) == 0);
-                if (!plain && !g_relay.enc) {
-                    relay_drop_locked(0);
-                    dlog("head-unit aes init failed");
+                g_relay.enc = r_ctr_init(&g_relay.ctx, key, iv) == 0;
+                if (!g_relay.enc) {
+                    relay_drop_locked(1);
+                    dlog("car stream AES init failed; no video sent");
                 } else if (cfg && cfg_len &&        /* replay the real config header + body */
                     (send_full(g_relay.fd, cfg_hdr, sizeof *cfg_hdr) != 0 ||
                      send_full(g_relay.fd, cfg, cfg_len) != 0)) {
@@ -1415,7 +1442,12 @@ static int relay_frame(unsigned rx_gen, int *thread_attached, ScreenHeader *h, u
             /* One continuous CTR span over the AVCC AU, matching AES_CTR_Update
              * in SendProxyScreenFrame and the head unit's decrypt of bodySize
              * bytes. Config frames are not fed in, so they never advance it. */
-            if (g_relay.enc) r_ctr_update(&g_relay.ctx, body, h->bodySize, body);
+            if (!g_relay.enc || r_ctr_update(&g_relay.ctx, body, h->bodySize, body) != 0) {
+                g_relay.err++;
+                relay_drop_locked(1);
+                pthread_mutex_unlock(&g_relay_lock);
+                return 0;
+            }
             if (send_full(g_relay.fd, h, sizeof *h) != 0 || send_full(g_relay.fd, body, h->bodySize) != 0) {
                 g_relay.err++;
                 relay_drop_locked(1);
@@ -1456,8 +1488,8 @@ static void *rx_thread(void *varg) {
     unsigned long frames = 0, idr = 0, bad = 0, relayed = 0, send_err = 0;
     int log_now = 0;
 #if STEP_DECRYPT
-    int desync = 0, last_view = -1;
-    long kf_last = 0, kf_late = 0;          /* back-channel rate limit; late key frame due (s) */
+    int desync = 0;
+    long kf_late = 0;
     uint8_t cc_key[32], cc_nonce[8];
 #endif
     /* full cached VIDEO_CONFIG (header + body), replaced on every config */
@@ -1469,8 +1501,9 @@ static void *rx_thread(void *varg) {
      * connection (a new SETUP starts a new thread and a new counter). */
     memset(cc_key, 0, sizeof cc_key);
     memset(cc_nonce, 0, sizeof cc_nonce);
-    dec_ok = chacha_derive(a.session, a.cid, cc_key);
-    if (!dec_ok) dlog("111 decrypt disabled");
+    memcpy(cc_key, a.key, sizeof cc_key);
+    memset(a.key, 0, sizeof a.key);
+    dec_ok = 1; /* key derivation succeeded before SETUP was acknowledged */
 #else
     dlog("transport phase: counting 111 frames, not decrypting (ChaCha)");
     (void)au_ok;   /* decrypt check; live only in the STEP_DECRYPT build */
@@ -1499,39 +1532,23 @@ static void *rx_thread(void *varg) {
         uint8_t *body = 0;
         int rr;
 #if STEP_DECRYPT
-        /* cockpit layout change / key frame request from the head unit -> tell the phone */
         if (STEP_RELAY && !disabled() && !flag(NORELAY_FILE)) {
-            int kf = 0, vw = relay_poll_bc(&kf);
             long now = time_plain(0);
-            if (vw >= 0 && vw < VIEW_COUNT && vw != last_view) {
-                last_view = vw;
-                if (strcmp(view_url(vw), g_cur_url) != 0) send_showui(a.session, view_url(vw));
-                send_view(a.session, vw);
-            }
-            if (kf && now - kf_last >= KF_MIN_S) {
-                kf_last = now;
-                dlog("head-unit asked for a key frame");
-                ask_keyframe(a.session);
-            } else if (kf && (!kf_late || kf_late > kf_last + KF_MIN_S)) {
-                kf_late = kf_last + KF_MIN_S;  /* rate-limited: defer, do not drop */
-            }
-            /* A head-unit decoder that attaches just after the relay's first
-             * IDR never gets a picture. One more IDR a few seconds later also
-             * covers head-unit builds that do not send KEYF. */
+            service_car_commands(a.session, a.gen);
             if (kf_late && now >= kf_late) {
                 kf_late = 0;
-                dlog("late key frame for the head unit");
                 ask_keyframe(a.session);
             }
         }
 #endif
-        rr = read_full(c, &h, sizeof h, a.gen);
+        rr = read_full(c, &h, sizeof h, a.gen, 1);
+        if (rr == 2) continue;
         if (rr <= 0) break;
         if (h.bodySize > MAX_BODY) { dlog("reject bodySize=%u", h.bodySize); break; }
         if (h.bodySize) {
             body = malloc(h.bodySize);
             if (!body) break;
-            if (read_full(c, body, h.bodySize, a.gen) <= 0) { free(body); break; }
+            if (read_full(c, body, h.bodySize, a.gen, 0) <= 0) { free(body); break; }
         }
 
         if (h.opcode == OP_VIDEO_CONFIG) {
@@ -1662,9 +1679,10 @@ static int open_listener(int *out_port) {
 
 /* Build a 111 stream entry in the response: clone of the requested desc +
  * dataPort + streamID=111 (same shape as the head-unit hook). */
-static void append_response_111(CFRef response, CFRef requested_111, int port) {
+static int append_response_111(CFRef response, CFRef requested_111, int port) {
     CFRef old, arr, sd;
-    if (!is_type(response, cf_dict_type) || !requested_111) return;
+    int ok = 0;
+    if (!is_type(response, cf_dict_type) || !requested_111) return -1;
     old = cf_dict_get(response, k_streams);
     arr = is_type(old, cf_array_type) ? cf_array_copy(0, 0, old) : cf_array_new(0, 0, array_cb);
     sd = cf_dict_copy(0, 0, requested_111);
@@ -1686,74 +1704,92 @@ static void append_response_111(CFRef response, CFRef requested_111, int port) {
         }
         cf_array_append(arr, sd);
         cf_dict_set(response, k_streams, arr);
+        ok = 1;
     }
     if (sd) cf_release(sd);
     if (arr) cf_release(arr);
+    return ok ? 0 : -1;
 }
 
-static void start_receiver(uint64_t cid, void *session, CFRef response, CFRef req111) {
+static int start_receiver(uint64_t cid, void *session, CFRef response, CFRef req111) {
     int port = 0, lfd;
     struct rx_arg *arg;
-    unsigned gen;
+    unsigned gen, i;
     pthread_t th;
+    uint8_t key[32] = {0};
+#if STEP_DECRYPT
+    if (!chacha_derive(session, cid, key)) return -1;
+#endif
     /* retire any previous receiver (it polls g_rx_gen and exits within ~1s,
      * closing its own listen fd; until then port 7100 may still be bound, so
      * the new listener falls back to an ephemeral port - fine, the actual port
      * is what we return in the response). */
     pthread_mutex_lock(&g_lock);
     gen = ++g_rx_gen;
+    for (i = 0; i < 3; ++i) {
+        g_controls[i].inflight = 0;
+        g_controls[i].next_try = 0;
+    }
     pthread_mutex_unlock(&g_lock);
 
     lfd = open_listener(&port);
-    if (lfd < 0) { dlog("111 listener bind failed: %s", strerror(errno)); return; }
+    if (lfd < 0) { memset(key, 0, sizeof key); dlog("111 listener bind failed: %s", strerror(errno)); return -1; }
     arg = malloc(sizeof *arg);
-    if (!arg) { close(lfd); return; }
+    if (!arg) { memset(key, 0, sizeof key); close(lfd); return -1; }
     arg->listen_fd = lfd;
     arg->gen = gen;
     arg->cid = cid;
     arg->session = (session && cf_retain) ? cf_retain(session) : session;
+    memcpy(arg->key, key, sizeof key);
+    memset(key, 0, sizeof key);
     if (pthread_create(&th, 0, rx_thread, arg) != 0) {
         if (arg->session && cf_release) cf_release(arg->session);
         close(lfd); free(arg);
         dlog("111 receiver thread create failed");
-        return;
+        return -1;
     }
     pthread_detach(th);
-    append_response_111(response, req111, port);
+    if (append_response_111(response, req111, port) != 0) {
+        pthread_mutex_lock(&g_lock); ++g_rx_gen; pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
     dlog("111 receiver ready cid=%llu port=%d", (unsigned long long)cid, port);
+    return 0;
 }
 
 /* ============ SESSION SETUP ============ */
 OSStatus AirPlayReceiverSessionSetup(void *session, CFRef request, CFRef *response) {
     OSStatus e;
-    CFRef req111;
+    CFRef req111, stock = 0;
+    int cluster_only = 0;
     if (!ready()) return r_setup ? r_setup(session, request, response) : -1;
-    if (t_busy) return r_setup(session, request, response);
-    t_busy = 1;
-    if (CLUSTER_DIAG && !disabled()) log_stream_types("setup request", request);
-    e = r_setup(session, request, response);
-    if (disabled()) { t_busy = 0; return e; }
-    if (CLUSTER_DIAG || e != 0) dlog("setup rc=%d response=%s", e, (response && *response) ? "yes" : "no");
-    if (e == 0 && response && *response) {
-        /* iOS negotiates features: it proposes a FeatureKey list and validates
-         * the cluster display against the features the RECEIVER accepts in the
-         * SETUP response. Without altScreen there, iOS logs "altScreen not
-         * defined but display structures found" and deactivates the endpoint
-         * (iPhone log, v1144). The head-unit hook merges into every SETUP
-         * response too (set_reference_enabled_features). Response is the
-         * CFDictionaryCreateMutable dict from AirPlayReceiverSessionSetup. */
-        if (ADVERT_FEATURES && ADVERT_DISPLAY) {
-            merge_features(*response);
-            if (CLUSTER_DIAG) dlog("setup response enabledFeatures += altScreen, viewAreas");
+    if (t_busy || disabled()) return r_setup(session, request, response);
+    req111 = find_stream(request, TYPE_CLUSTER);
+    if (req111) {
+        stock = without_cluster(request, "streams");
+        if (!stock) return -1;
+        cluster_only = cf_array_count(streams_of(stock)) == 0;
+        if (cluster_only && (!response || !dict_cid(req111) || !car_available())) {
+            cf_release(stock);
+            return -1;
         }
-        if (CLUSTER_DIAG) log_stream_types("setup response", *response);
-        req111 = find_stream(request, TYPE_CLUSTER);
-        if (req111) {
-            uint64_t cid = dict_cid(req111);
-            dlog("setup request has 111 cid=%llu", (unsigned long long)cid);
-            if (!STEP_RECEIVE) dlog("step 1: observe only, not opening a 111 listener");
-            else if (cid) start_receiver(cid, session, *response, req111);
-            else dlog("111 request missing streamConnectionID; skip");
+    }
+    t_busy = 1;
+    if (cluster_only) {
+        *response = cf_dict_new(0, 0, dict_key_cb, dict_val_cb);
+        e = *response ? 0 : -1;
+    } else e = r_setup(session, stock ? stock : request, response);
+    if (stock) cf_release(stock);
+    if (!e && response && *response) {
+        if (car_available()) merge_features(*response, car_view_count() > 0);
+        if (req111 && STEP_RECEIVE) {
+            OSStatus cluster_e = -1;
+            if (dict_cid(req111) && car_available())
+                cluster_e = start_receiver(dict_cid(req111), session, *response, req111);
+            /* A rejected optional stream must not undo stock's successful
+             * main/audio SETUP. Failed starts never append a 111 response. */
+            if (cluster_only) e = cluster_e;
+            else if (cluster_e) dlog("phone SETUP 111 unavailable rc=%d; preserving stock streams", cluster_e);
         }
     }
     t_busy = 0;
@@ -1761,35 +1797,30 @@ OSStatus AirPlayReceiverSessionSetup(void *session, CFRef request, CFRef *respon
 }
 
 void AirPlayReceiverSessionTearDown(void *session, CFRef request, OSStatus reason, void *done) {
+    int full;
+    CFRef stock = 0;
     if (!ready()) { if (r_teardown) r_teardown(session, request, reason, done); return; }
-    if (!disabled()) {
-        if (CLUSTER_DIAG && request) log_stream_types("teardown request", request);
-        dlog("teardown reason=%d request=%s", reason, request ? "dict" : "NULL");
-    }
-    /* a NULL request (whole session) or one that names 111 retires the receiver */
-    if (!disabled() && (request == 0 || find_stream(request, TYPE_CLUSTER))) {
+    if (disabled()) { r_teardown(session, request, reason, done); return; }
+    full = !streams_of(request) || cf_array_count(streams_of(request)) == 0;
+    if (full || find_stream(request, TYPE_CLUSTER)) {
         pthread_mutex_lock(&g_lock);
-        g_rx_gen++;
+        ++g_rx_gen;
         pthread_mutex_unlock(&g_lock);
-        dlog("teardown retires 111 receiver");
     }
-    /* Whole phone session over: close the head-unit relay socket too instead of
-     * leaving it to fail on the next send. CPAAProxyEx tears the head-unit
-     * screen down when the phone leaves, and the next phone session makes the
-     * head unit re-SETUP the screen (requestUI -> SetupScreen with the injected
-     * 111), which advances g_hu_gen and lets relay_frame connect again. dead=1
-     * so nothing retries against the old head-unit listener in between. */
-    if (STEP_RELAY && !disabled() && request == 0) {
-        unsigned long sent, err;
-        int had;
-        pthread_mutex_lock(&g_relay_lock);
-        had = g_relay.fd >= 0;
-        sent = g_relay.relayed; err = g_relay.err;
-        relay_drop_locked(1);
-        pthread_mutex_unlock(&g_relay_lock);
-        if (had) dlog("session end: head-unit relay closed (relayed=%lu err=%lu)", sent, err);
+    if (!full && find_stream(request, TYPE_CLUSTER)) {
+        stock = without_cluster(request, "streams");
+        /* Failure to allocate a filtered request must never tear down stock 110. */
+        if (!stock || cf_array_count(streams_of(stock)) == 0) {
+            if (stock) cf_release(stock);
+            if (done) *(uint8_t *)done = 0;
+            return;
+        }
     }
-    r_teardown(session, request, reason, done);
+    /* Phone teardown does not own the car key/socket. CPAA's full car teardown
+     * calls HTTPClientInvalidate before clearing gAirPlayClient; that boundary
+     * retires the independent stream if the car session also ends. */
+    r_teardown(session, stock ? stock : request, reason, done);
+    if (stock) cf_release(stock);
 }
 
 __attribute__((constructor)) static void init(void) {

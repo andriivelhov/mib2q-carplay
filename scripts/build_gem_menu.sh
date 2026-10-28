@@ -36,6 +36,7 @@ cluster_maneuver|cluster_maneuver|Cluster map turn card ON / OFF (toggle, CarPla
 cluster_eta|cluster_eta|Cluster map ETA ON / OFF (toggle, CarPlay, default OFF)
 cluster_speed|cluster_speed|Cluster map speed limit ON / OFF (toggle, CarPlay, default OFF)
 cluster_compass|cluster_compass|Cluster map compass ON / OFF (toggle, CarPlay, default OFF)
+cluster_wide_all|cluster_wide_all|Cluster map all features on wide view ON / OFF (toggle, CarPlay, default OFF)
 reacquire|reacquire|Re-request cluster map (test app switching)
 hwdec|hwdec|HW decoder ON / OFF (toggle, default ON)
 hwdelay|hwdelay|HW decoder 2-min delayed start ON / OFF (toggle, CarPlay, default OFF)

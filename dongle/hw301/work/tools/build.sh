@@ -44,6 +44,9 @@ MAINSYM="${CHECK_SYM:-AirPlayReceiverSessionSetup}"  # a symbol to sanity-check 
 echo ">> 1. fresh-extract stock v${STOCK} rootfs -> $BUILD  (wrapping $WRAP)"
 rm -rf "$BUILD"; unsquashfs -d "$BUILD" "$STOCK_IMG" >/dev/null
 test -f "$BUILD/lib/$WRAP" || { echo "no $WRAP in stock image"; exit 1; }
+if [ "${CLUSTER_SRC:-cluster_dual.c}" = cluster_dual.c ]; then
+  python3 work/tools/check_native_abi.py "$BUILD"
+fi
 
 # build marker served by the dongle's web server (web files live in the app
 # partition). Lets us verify the flash actually landed, independent of the shim:
