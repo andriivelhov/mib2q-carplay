@@ -66,6 +66,16 @@ Changes since [1.3.1](CHANGELOG-1.3.1.md).
   - First car test on 2026-10-28: Apple Maps maneuvers, lane guidance and route updates
     reached the car; the cluster map kept running (no bad or dropped frames).
 
+- **Android Auto cluster map on Korean firmware `MHI2Q_KR_AUG22_P1201` (MU1201, issue #33).**
+  The unit's `libautoreceiver.so` is byte-identical to the MU0918 one; its `gal` is a later
+  build of the same code (only the build date, host and changelist differ). The hook therefore
+  gets a built-in receiver profile `P1201` from the unit's files, and
+  `scripts/aa_receiver_profile.py` reports every built-in `gal` (P5152, P1201) as "nothing to
+  port". `aa_cluster_hook.log`: `init enabled profile=P1201`. The Java patch needs no change
+  either: the stock classes it replaces are byte-identical to P5152's (54 class files), the jar
+  built against the unit's `lsd.jxe` is byte-identical to the release jar, and the stock linkage
+  audit passes against it (0 errors). *Car test pending.*
+
 ## Changed
 
 - **The head unit no longer needs to recognise the HW301.** The v1172 image uses the normal

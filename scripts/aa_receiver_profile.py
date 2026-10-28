@@ -5,8 +5,9 @@
 
 The logging M.I.B. mod copies both files from the unit once per card. This script
 
-  1. compares them with the receiver pair validated on the car (MU0918). Identical
-     files mean the built-in profile already applies: nothing to port;
+  1. compares them with the receiver pair validated on the car (MU0918) and the gal
+     builds that have their own entry. A match means a built-in profile already
+     applies: nothing to port;
   2. otherwise reads the symbols the hook checks from the ELF dynamic symbol tables and
      prints a profile entry for aa_hook.c, plus the matching abi.fingerprint values
      that /tmp/aa_cluster_hook.log shows on the unit.
@@ -22,6 +23,11 @@ import sys
 MU0918 = {
     "gal": "6fffb3608a5c504ec245b90ec4aed2646209dffd0644c5fa0504c29d0603a1b4",
     "libautoreceiver.so": "6ef4abea8264ab7787b0ecb3fe278a65488301f703148d0175010f7b228bdaf6",
+}
+# Other gal builds that run the MU0918 receiver and have their own entry in aa_hook.c.
+BUILT_IN_GAL = {
+    "a659a9551b139910937539e64d28ac1af95617461e886f3882b7bd2897acc0cf": "P5152",
+    "e35627a08a01980f9b56000b8fbd4b4fae5d9b4c8f7dcd22c4818124fc5f1ef5": "P1201",
 }
 
 RECEIVER = [
@@ -89,6 +95,10 @@ def main():
         print("\nIdentical to the receiver validated on the car (MU0918): the built-in profile applies.")
         return 0
 
+    if hashes["libautoreceiver.so"] == MU0918["libautoreceiver.so"] and hashes["gal"] in BUILT_IN_GAL:
+        print("\nThe receiver is identical to MU0918 and this gal is built in (profile %s): nothing to port."
+              % BUILT_IN_GAL[hashes["gal"]])
+        return 0
     if hashes["libautoreceiver.so"] == MU0918["libautoreceiver.so"]:
         print("\nThe receiver is identical to MU0918, so its object layouts are the validated ones;"
               "\nonly gal differs. The entry below (gal addresses from this gal) is safe to add.")

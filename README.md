@@ -60,7 +60,7 @@ CarPlay or Android Auto automatically.
   Classic and Sport cockpit layouts), the same turn arrow, distance, lanes, route text and
   HUD as CarPlay, and Android Auto cover art. Tested on the car; the steering-wheel roller
   does not zoom the Android Auto map (Android Auto has no zoom command for it). The cluster
-  map needs a receiver profile for the unit's `gal` (MU0918 and MU1329 are built in). See
+  map needs a receiver profile for the unit's `gal` (MU0918, MU1329 and MU1201 are built in). See
   [`docs/android-auto/overview.md`](docs/android-auto/overview.md).
 
 **Compatibility:** Audi MHI2Q units with a fully digital cluster (Virtual Cockpit).

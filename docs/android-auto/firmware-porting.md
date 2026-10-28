@@ -19,6 +19,7 @@ the cockpit and HUD does not depend on this; it works on every firmware the jar 
 |---|---|---|
 | `MHI2Q_US_AUG22_P3639` MU0918 | sha256 `6ef4abea…` (gal `6fffb360…`) | built in, validated on the car upstream |
 | `MHI2Q_ER_AUG22_P5152` MU1329 | identical to MU0918 (gal `a659a955…` differs) | built in from the unit's files (`P5152`), validated on the car (Audi A5 F5) |
+| `MHI2Q_KR_AUG22_P1201` MU1201 | identical to MU0918 (gal `e35627a0…` differs) | built in from the unit's files (`P1201`, [issue #33](https://github.com/kamgurgul/mib2q-carplay/issues/33)); car test pending |
 
 ## 1. Get the files and the fingerprint
 
@@ -35,8 +36,8 @@ the cockpit and HUD does not depend on this; it works on every firmware the jar 
 
 ## 2. Read the result
 
-- **`Identical to the receiver validated on the car (MU0918)`**: nothing to port. The log
-  already says `init enabled profile=MU0918`.
+- **`Identical to the receiver validated on the car (MU0918)`** or **`this gal is built in
+  (profile …)`**: nothing to port. The log already says `init enabled profile=<that name>`.
 - **Missing symbols**: this receiver cannot run the hook. Use the cluster guidance without the
   map (`aa_cluster.off` keeps the launcher quiet).
 - **A candidate profile entry**: the symbols exist at other offsets. The offsets must equal the

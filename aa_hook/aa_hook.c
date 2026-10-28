@@ -77,6 +77,11 @@ static const struct aa_profile profiles[] = {
      * read from the unit, carplay_logs/aa). */
     { "P5152", 0xe4928, 0x102b90, 0x102af0, 0xfafc4, 0xec748, 0xfa978, 0xec294,
       0x258580, 0x251b28 },
+    /* MHI2Q_KR_AUG22_P1201 MU1201 (issue #33): libautoreceiver.so byte-identical to MU0918 as
+     * well; gal is a later build of the same code (sha256 e35627a0..., changelist 10768925 vs
+     * P5152's 10757182, read from the unit). */
+    { "P1201", 0xe4928, 0x102b90, 0x102af0, 0xfafc4, 0xec748, 0xfa978, 0xec294,
+      0x259598, 0x252b40 },
 };
 
 /* ---- state -------------------------------------------------------------------------- */
