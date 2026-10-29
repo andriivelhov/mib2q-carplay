@@ -79,10 +79,36 @@ struct altr_hwdec {
     int64_t ts;
     uint64_t first_input_ms;
     int busy_drops;
+    int post_wait;          /* 1: old behaviour, post blocks until the compositor is idle */
+    /* Per-picture timing (us), printed every HW_STATS_EVERY pictures. */
+    uint64_t st_n, st_blit_sum, st_blit_max, st_post_sum, st_post_max, st_slow_input;
 
     AVCodecContext *pctx;
     AVCodecParserContext *parser;
 };
+
+/* Marker that restores the pre-vfix2 post (SCREEN_WAIT_IDLE on the window post). */
+#define HW_POST_WAIT_MARKER "/mnt/app/root/altscreen_render.postwait"
+#define HW_STATS_EVERY 600u
+
+static uint64_t mono_us(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000u + (uint64_t)(t.tv_nsec / 1000L);
+}
+
+static void stats_print(altr_hwdec_t *d)
+{
+    fprintf(stderr, "hw_decode: %llu pictures: blit avg %llu max %llu us, post avg %llu max %llu us, "
+            "input waits >50 ms %llu%s\n",
+            (unsigned long long)d->st_n,
+            (unsigned long long)(d->st_blit_sum / d->st_n), (unsigned long long)d->st_blit_max,
+            (unsigned long long)(d->st_post_sum / d->st_n), (unsigned long long)d->st_post_max,
+            (unsigned long long)d->st_slow_input, d->post_wait ? " (post wait)" : "");
+    d->st_n = d->st_blit_sum = d->st_blit_max = d->st_post_sum = d->st_post_max = 0;
+    d->st_slow_input = 0;
+}
 
 /* ---- OMX callbacks (component threads) ---- */
 
@@ -150,13 +176,17 @@ static OMX_ERRORTYPE on_fill_done(OMX_HANDLETYPE h, void *app, OMX_BUFFERHEADERT
      * component rejects that (log set 017, FillThisBuffer failed on the first
      * picture). Hold it and return the previous one instead - the pattern that
      * ran 1289 pictures in log set 011. b's pixels are already copied when the
-     * blit+post below returns (WAIT_IDLE), so holding it costs one buffer. */
+     * blit flush below returns (WAIT_IDLE), so holding it costs one buffer. */
     give_back = NULL;
     if (b->nFilledLen > 0) {
         /* Hardware blit (tiled NV12 -> RGBA) into the visible window's next render
-         * buffer, then post. Post flushes the blit; WAIT_IDLE means the decoder
-         * buffer is no longer read when it is handed back below. Only this callback
-         * thread touches the screen while the decoder runs. */
+         * buffer, then post. Flushing the blits with WAIT_IDLE means the decoder
+         * buffer is no longer read when it is handed back below; the post itself
+         * no longer waits for the compositor (it held this thread, and with it the
+         * decoder's output, for a whole composition: fast map rotation backed the
+         * hook queue up, car log 004). Only this callback thread touches the screen
+         * while the decoder runs. */
+        uint64_t t0 = mono_us(), t1 = 0, t2;
         /* The source rectangle is the view's crop of the coded picture (the whole
          * picture for CarPlay); the blit is 1:1, never scaled. */
         screen_buffer_t dst[4] = { NULL, NULL, NULL, NULL };
@@ -177,12 +207,21 @@ static OMX_ERRORTYPE on_fill_done(OMX_HANDLETYPE h, void *app, OMX_BUFFERHEADERT
             fprintf(stderr, "hw_decode: screen_blit tiled NV12 -> RGBA failed errno=%d -> software fallback\n",
                     errno);
             d->failed = 1;
-        } else if (screen_post_window(d->win, dst[0], 1, rect, SCREEN_WAIT_IDLE) != 0) {
+        } else if (!d->post_wait && screen_flush_blits(d->sctx, SCREEN_WAIT_IDLE) != 0) {
+            fprintf(stderr, "hw_decode: screen_flush_blits failed errno=%d -> software fallback\n", errno);
+            d->failed = 1;
+        } else if ((t1 = mono_us()),
+                   screen_post_window(d->win, dst[0], 1, rect, d->post_wait ? SCREEN_WAIT_IDLE : 0) != 0) {
             fprintf(stderr, "hw_decode: screen_post_window failed errno=%d\n", errno);
         } else {
+            t2 = mono_us();
             pthread_mutex_lock(&d->lock);
             d->frames++;
             pthread_mutex_unlock(&d->lock);
+            ++d->st_n;
+            d->st_blit_sum += t1 - t0; if (t1 - t0 > d->st_blit_max) d->st_blit_max = t1 - t0;
+            d->st_post_sum += t2 - t1; if (t2 - t1 > d->st_post_max) d->st_post_max = t2 - t1;
+            if (d->st_n >= HW_STATS_EVERY) stats_print(d);
         }
         if (d->failed) return 0;
     }
@@ -331,6 +370,8 @@ static int send_input(altr_hwdec_t *d, const uint8_t *p, size_t n, OMX_U32 flags
     OMX_BUFFERHEADERTYPE *b;
     int idx = -1;
 
+    uint64_t w0 = mono_us();
+
     clock_gettime(CLOCK_REALTIME, &t);
     t.tv_nsec += 200000000L;
     if (t.tv_nsec >= 1000000000L) { t.tv_sec++; t.tv_nsec -= 1000000000L; }
@@ -338,6 +379,7 @@ static int send_input(altr_hwdec_t *d, const uint8_t *p, size_t n, OMX_U32 flags
     while (!d->nin_free && !d->failed)
         if (pthread_cond_timedwait(&d->cond, &d->lock, &t) == ETIMEDOUT) break;
     if (d->nin_free && !d->failed) idx = d->in_free[--d->nin_free];
+    if (mono_us() - w0 > 50000u) ++d->st_slow_input;
     pthread_mutex_unlock(&d->lock);
     if (d->failed) return -1;
     if (idx < 0) {
@@ -408,6 +450,7 @@ altr_hwdec_t *altr_hwdec_create(const altr_view_t *view, int displayable_id, int
     d = (altr_hwdec_t *)calloc(1, sizeof(*d));
     if (!d) return NULL;
     d->width = width; d->height = height; d->shown = -1;
+    d->post_wait = access(HW_POST_WAIT_MARKER, F_OK) == 0;
     d->view = *view;
     pthread_mutex_init(&d->lock, NULL);
     pthread_cond_init(&d->cond, NULL);
@@ -469,10 +512,19 @@ altr_hwdec_t *altr_hwdec_create(const altr_view_t *view, int displayable_id, int
     cfg.height = view->view_h;
     cfg.format = 8;                 /* SCREEN_FORMAT_RGBA8888, like the GL path */
     cfg.usage = 0x0E;               /* NATIVE | WRITE | READ: blit destination */
-    cfg.nbuffers = 2;
+    /* Three buffers once the post no longer waits for the compositor: one shown,
+     * one queued, one being blitted. Fall back to the old two if refused. */
+    cfg.nbuffers = d->post_wait ? 2 : 3;
     cfg.transparent = 0;
     d->cs = cluster_surface_create(&cfg);
+    if (!d->cs && cfg.nbuffers > 2) {
+        fprintf(stderr, "hw_decode: window 99 with 3 buffers refused; using 2\n");
+        cfg.nbuffers = 2;
+        d->cs = cluster_surface_create(&cfg);
+    }
     if (!d->cs) goto fail;
+    fprintf(stderr, "hw_decode: window 99 %d buffers, post %s\n", cfg.nbuffers,
+            d->post_wait ? "waits for the compositor" : "does not wait");
     d->win = cluster_surface_window(d->cs);
     d->sctx = cluster_surface_context(d->cs);
     {
